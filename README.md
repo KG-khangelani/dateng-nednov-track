@@ -51,13 +51,47 @@ Gold tables expected by validation queries:
 
 ## 3) Exact local build/run commands (scoring-like constraints)
 
-### 3.1 Build
+### 3.0 Container-first workflow
+
+Use Docker as the source of truth for dependency setup and validation. The scorer
+runs this repository in a container, not in a local Python virtual environment, so
+the local workflow should mirror that shape as closely as possible.
+
+The repository includes `infrastructure/Dockerfile.base` for building the local
+challenge base image. That base image contains Python, Java, PySpark, Delta Lake,
+pandas, PyArrow, PyYAML, and DuckDB. `requirements.txt` is only for extra
+packages beyond the base image.
+
+Avoid installing the base Spark stack into `venv/`; PySpark is large, Java-backed,
+and easier to keep compatible inside the Docker image.
+
+### 3.1 Build the local base image
+
+Run this once per machine, or whenever `infrastructure/Dockerfile.base` changes:
+
+```bash
+docker build -t nedbank-de-challenge/base:1.0 -f infrastructure/Dockerfile.base infrastructure
+```
+
+Optional smoke test:
+
+```bash
+docker run --rm nedbank-de-challenge/base:1.0 python -c "import pyspark, delta, pandas, pyarrow, yaml, duckdb; print('base deps ok')"
+```
+
+### 3.2 Build the submission image
 
 ```bash
 docker build -t my-submission:test .
 ```
 
-### 3.2 Prepare local test mount
+Optional smoke test:
+
+```bash
+docker run --rm my-submission:test python -c "import pyspark, delta, pandas, pyarrow, yaml, duckdb; print('submission deps ok')"
+```
+
+### 3.3 Prepare local test mount
 
 Create a local directory shaped exactly like the scorer mount:
 
@@ -71,7 +105,19 @@ cp config/pipeline_config.yaml /tmp/test-data/config/
 cp config/dq_rules.yaml /tmp/test-data/config/
 ```
 
-### 3.3 Run with scorer-equivalent resource/security flags
+On Windows PowerShell, the repository-local data layout can also be mounted
+directly:
+
+```powershell
+docker run --rm `
+  -v "h:\hikrepos\dateng-nednov-track\data\input:/data/input:ro" `
+  -v "h:\hikrepos\dateng-nednov-track\config:/data/config:ro" `
+  -v "h:\hikrepos\dateng-nednov-track\data\output:/data/output:rw" `
+  my-submission:test `
+  python pipeline/run_all.py
+```
+
+### 3.4 Run with scorer-equivalent resource/security flags
 
 ```bash
 docker run --rm \
@@ -97,7 +143,21 @@ For Stage 3, add:
 -v /tmp/test-stream:/data/stream:ro
 ```
 
-## 4) Pipeline execution flow and non-interactive behavior
+## 4) Local development tools: venv, notebooks, and DAGs
+
+A local `venv` is optional and should be treated as a convenience for editor
+features, quick Python-only checks, or lightweight scripts. It is not the
+authoritative dependency environment for this challenge.
+
+Notebooks may be useful for exploring input data and sketching transformations,
+but they must not become part of the scoring path. Keep reproducible logic in
+`pipeline/*.py`.
+
+Do not add Airflow or external orchestrator DAGs for the scored path. For this
+repository, `pipeline/run_all.py` is the required DAG: a deterministic sequence
+of Bronze, Silver, and Gold steps that can run non-interactively in Docker.
+
+## 5) Pipeline execution flow and non-interactive behavior
 
 The required execution command is:
 
@@ -113,9 +173,9 @@ Operational requirements:
 - Do **not** rely on stdin.
 - Exit code must be `0` on success.
 
-## 5) Validation instructions
+## 6) Validation instructions
 
-### 5.1 Run the local test harness
+### 6.1 Run the local test harness
 
 ```bash
 bash infrastructure/run_tests.sh --stage 1 --data-dir /tmp/test-data --image my-submission:test
@@ -128,7 +188,7 @@ bash infrastructure/run_tests.sh --stage 2 --data-dir /tmp/test-data --image my-
 bash infrastructure/run_tests.sh --stage 3 --data-dir /tmp/test-data --stream-dir /tmp/test-stream --image my-submission:test
 ```
 
-### 5.2 Run SQL validation checks
+### 6.2 Run SQL validation checks
 
 Use the provided SQL checks in `docs/validation_queries.sql` against your Gold output.
 
@@ -147,7 +207,7 @@ Or from shell:
 duckdb < docs/validation_queries.sql
 ```
 
-## 6) Stage-specific operator notes
+## 7) Stage-specific operator notes
 
 ### Stage 1
 
@@ -166,7 +226,7 @@ duckdb < docs/validation_queries.sql
 - Include ADR at `adr/stage3_adr.md`.
 - Batch pipeline compatibility from Stage 2 must remain intact.
 
-## 7) Reference documents
+## 8) Reference documents
 
 - `docs/submission_guide.md`
 - `docs/README_DOCKER.md`
@@ -176,9 +236,9 @@ duckdb < docs/validation_queries.sql
 - `docs/stage3_spec_addendum.md`
 
 
-## 8) Visual model: stages and medallion levels
+## 9) Visual model: stages and medallion levels
 
-### 8.1 Stage progression (what changes over time)
+### 9.1 Stage progression (what changes over time)
 
 ```mermaid
 flowchart LR
@@ -207,7 +267,7 @@ Add streaming + ADR]
     classDef req fill:#eef7ff,stroke:#4a90e2,color:#0b2540;
 ```
 
-### 8.2 Medallion flow (what happens inside one run)
+### 9.2 Medallion flow (what happens inside one run)
 
 ```mermaid
 flowchart TD
@@ -235,7 +295,7 @@ current_balances
 recent_transactions]
 ```
 
-### 8.3 How Stage 3 extends (does not replace) batch
+### 9.3 How Stage 3 extends (does not replace) batch
 
 ```mermaid
 flowchart LR

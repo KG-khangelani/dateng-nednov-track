@@ -1,1 +1,41 @@
-data
+# Challenge data and local mounts
+/data/
+data/
+local_data/
+
+# Pipeline output — never commit these
+output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Temp files
+*.tmp
+*.temp
+*.log
+.tmp/
+tmp/
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Test artefacts
+.pytest_cache/

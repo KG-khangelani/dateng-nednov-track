@@ -249,4 +249,3 @@ flowchart LR
 
     BatchPath --- StreamingPath
 ```
-

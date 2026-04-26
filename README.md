@@ -174,3 +174,78 @@ duckdb < docs/validation_queries.sql
 - `docs/validation_queries.sql`
 - `docs/stage2_spec_addendum.md`
 - `docs/stage3_spec_addendum.md`
+
+
+## 8) Visual model: stages and medallion levels
+
+### 8.1 Stage progression (what changes over time)
+
+```mermaid
+flowchart LR
+    S1[Stage 1
+Core batch pipeline] --> S2[Stage 2
+Scale + DQ + merchant_subcategory]
+    S2 --> S3[Stage 3
+Add streaming + ADR]
+
+    S1a[Required:
+- Bronze/Silver/Gold batch outputs]:::req
+    S2a[Additional required:
+- config/dq_rules.yaml
+- /data/output/dq_report.json
+- Stage 1 queries still pass]:::req
+    S3a[Additional required:
+- /data/stream input processing
+- /data/output/stream_gold outputs
+- adr/stage3_adr.md
+- Stage 2 batch still works]:::req
+
+    S1 --- S1a
+    S2 --- S2a
+    S3 --- S3a
+
+    classDef req fill:#eef7ff,stroke:#4a90e2,color:#0b2540;
+```
+
+### 8.2 Medallion flow (what happens inside one run)
+
+```mermaid
+flowchart TD
+    A[/data/input/accounts.csv
+/data/input/customers.csv
+/data/input/transactions.jsonl/] --> B[Bronze
+Raw Delta tables
++ ingestion_timestamp]
+    B --> C[Silver
+Deduplicate + type standardise
+DQ flagging]
+    C --> D[Gold
+fact_transactions
+dim_accounts
+dim_customers]
+
+    E[python pipeline/run_all.py
+(non-interactive)] --> B
+    E --> C
+    E --> D
+
+    C -. Stage 2+ .-> F[/data/output/dq_report.json/]
+    G[/data/stream/* (Stage 3)/] -. Stage 3 .-> H[stream_gold
+current_balances
+recent_transactions]
+```
+
+### 8.3 How Stage 3 extends (does not replace) batch
+
+```mermaid
+flowchart LR
+    subgraph BatchPath[Batch path (must continue to pass)]
+      I[input batch files] --> J[Bronze] --> K[Silver] --> L[Gold]
+    end
+
+    subgraph StreamingPath[Streaming extension (Stage 3)]
+      M[/data/stream micro-batches] --> N[Polling + incremental processing] --> O[/data/output/stream_gold]
+    end
+
+    BatchPath --- StreamingPath
+```

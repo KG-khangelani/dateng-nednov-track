@@ -27,6 +27,7 @@ ENV PATH="${JAVA_HOME}/bin:${PATH}"
 #   delta-spark==3.1.0  is compatible with  pyspark==3.5.0
 #   pyarrow==14.0.0     must not be upgraded (breaks delta-spark==3.1.0)
 RUN pip install --no-cache-dir \
+    numpy==1.26.4 \
     pyspark==3.5.0 \
     delta-spark==3.1.0 \
     pandas==2.1.0 \

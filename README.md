@@ -15,8 +15,9 @@ This repository implements the DE-track pipeline entry point expected by the sco
 The top-level flow is deterministic and non-interactive:
 
 1. `run_ingestion()`
-2. `run_transformation()`
-3. `run_provisioning()`
+2. `run_raw_profile()` audit-only raw anomaly profiling
+3. `run_transformation()`
+4. `run_provisioning()`
 
 No prompts or stdin reads are allowed in the scoring container (no TTY attached).
 
@@ -41,6 +42,7 @@ Your pipeline must write to the exact output roots below:
 - `/data/output/silver/`
 - `/data/output/gold/`
 - `/data/output/dq_report.json` (Stage 2+)
+- `/data/output/audit/raw_anomaly_profile.json` (audit-only, not scorer-facing)
 - `/data/output/stream_gold/` (Stage 3)
 
 Gold tables expected by validation queries:
@@ -165,7 +167,7 @@ The required execution command is:
 python pipeline/run_all.py
 ```
 
-`pipeline/run_all.py` orchestrates ingest → transform → provision in sequence and is the official entry point used by automated scoring.
+`pipeline/run_all.py` orchestrates ingest → raw profile audit → transform → provision in sequence and is the official entry point used by automated scoring.
 
 Operational requirements:
 

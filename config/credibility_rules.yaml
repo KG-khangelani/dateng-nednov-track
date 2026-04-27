@@ -1,0 +1,38 @@
+profile:
+  enabled: true
+  output_path: /data/output/audit/raw_anomaly_profile.json
+  top_k: 5
+  enable_top_k: true
+  enable_referential_checks: true
+  enable_province_match_check: true
+  enable_repeat_pattern_checks: false
+  repeat_pattern_threshold: 50
+  percentile_accuracy: 100
+  extreme_amount_threshold: 50000
+  extreme_balance_threshold: 250000
+
+advisory_rules:
+  INVALID_DOMAIN:
+    severity: medium
+    mode: audit_only
+    description: Values outside documented banking code sets.
+  TEMPORAL_ANOMALY:
+    severity: medium
+    mode: audit_only
+    description: Impossible or suspicious date relationships.
+  REFERENTIAL_GAP:
+    severity: high
+    mode: audit_only
+    description: Raw foreign keys that do not resolve across source files.
+  NUMERIC_OUTLIER:
+    severity: low
+    mode: audit_only
+    description: Amounts, balances, limits, or risk scores outside expected ranges.
+  PROFILE_INCOMPLETE:
+    severity: low
+    mode: audit_only
+    description: Missing customer or account profile fields.
+  LOCATION_MISMATCH:
+    severity: medium
+    mode: audit_only
+    description: Transaction province differs from linked customer province.

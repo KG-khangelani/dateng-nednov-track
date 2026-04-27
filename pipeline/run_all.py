@@ -1,6 +1,7 @@
 from pipeline.common import cleanup_spark_local_dir, infer_stage, load_config, spark_session
 from pipeline.ingest import run_ingestion
 from pipeline.provision import run_provisioning
+from pipeline.raw_profile import run_raw_profile
 from pipeline.stream_ingest import run_stream_ingestion
 from pipeline.transform import run_transformation
 
@@ -10,6 +11,10 @@ def main():
     spark = spark_session(config)
     try:
         run_ingestion()
+        try:
+            run_raw_profile()
+        except Exception as exc:
+            print(f"Raw anomaly profile skipped: {exc}")
         run_transformation()
         run_provisioning()
         if infer_stage(config) == "3":

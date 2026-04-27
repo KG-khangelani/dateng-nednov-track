@@ -1,44 +1,133 @@
-"""
-Gold layer: Join and aggregate Silver tables into the scored output schema.
+from pyspark.sql import functions as F
 
-Input paths (Silver layer output — read these, do not modify):
-  /data/output/silver/accounts/
-  /data/output/silver/transactions/
-  /data/output/silver/customers/
+from pipeline.common import (
+    RUN_TIMESTAMP,
+    execution_seconds,
+    infer_stage,
+    load_config,
+    output_path,
+    read_delta,
+    spark_session,
+    write_delta,
+    write_json_report,
+)
+from pipeline.metrics import METRICS, issue_list, set_gold_count
 
-Output paths (your pipeline must create these directories):
-  /data/output/gold/fact_transactions/     — 15 fields (see output_schema_spec.md §2)
-  /data/output/gold/dim_accounts/          — 11 fields (see output_schema_spec.md §3)
-  /data/output/gold/dim_customers/         — 9 fields  (see output_schema_spec.md §4)
 
-Requirements:
-  - Generate surrogate keys (_sk fields) that are unique, non-null, and stable
-    across pipeline re-runs on the same input data. Use row_number() with a
-    stable ORDER BY on the natural key, or sha2(natural_key, 256) cast to BIGINT.
-  - Resolve all foreign key relationships:
-      fact_transactions.account_sk  → dim_accounts.account_sk
-      fact_transactions.customer_sk → dim_customers.customer_sk
-      dim_accounts.customer_id      → dim_customers.customer_id
-  - Rename accounts.customer_ref → dim_accounts.customer_id at this layer.
-  - Derive dim_customers.age_band from dob (do not copy dob directly).
-  - Write each table as a Delta Parquet table.
-  - Do not hardcode file paths — read from config/pipeline_config.yaml.
-  - At Stage 2, also write /data/output/dq_report.json summarising DQ outcomes.
+def _with_surrogate_key(df, natural_key, sk_name):
+    return df.withColumn(
+        sk_name,
+        F.pmod(F.xxhash64(F.col(natural_key)), F.lit(9223372036854775807)).cast("bigint"),
+    )
 
-See output_schema_spec.md for the complete field-by-field specification.
-"""
+
+def _age_band(dob_col):
+    age = F.floor(F.months_between(F.current_date(), dob_col) / F.lit(12))
+    return (
+        F.when(age >= 65, F.lit("65+"))
+        .when(age >= 56, F.lit("56-65"))
+        .when(age >= 46, F.lit("46-55"))
+        .when(age >= 36, F.lit("36-45"))
+        .when(age >= 26, F.lit("26-35"))
+        .when(age >= 18, F.lit("18-25"))
+        .otherwise(F.lit("18-25"))
+    )
+
+
+def _write_report_if_needed(config, stage):
+    if stage == "1":
+        return
+    report = {
+        "$schema": "nedbank-de-challenge/dq-report/v1",
+        "run_timestamp": RUN_TIMESTAMP,
+        "stage": stage,
+        "source_record_counts": {
+            "accounts_raw": METRICS["source_record_counts"].get("accounts_raw", 0),
+            "transactions_raw": METRICS["source_record_counts"].get("transactions_raw", 0),
+            "customers_raw": METRICS["source_record_counts"].get("customers_raw", 0),
+        },
+        "dq_issues": issue_list(),
+        "gold_layer_record_counts": {
+            "fact_transactions": METRICS["gold_layer_record_counts"].get("fact_transactions", 0),
+            "dim_accounts": METRICS["gold_layer_record_counts"].get("dim_accounts", 0),
+            "dim_customers": METRICS["gold_layer_record_counts"].get("dim_customers", 0),
+        },
+        "execution_duration_seconds": execution_seconds(),
+    }
+    write_json_report(config, report)
 
 
 def run_provisioning():
-    # TODO: Implement Gold layer provisioning.
-    #
-    # Suggested steps:
-    #   1. Load pipeline_config.yaml to get input/output paths.
-    #   2. Initialise (or reuse) SparkSession.
-    #   3. Read Silver tables.
-    #   4. Build dim_customers with surrogate keys and derived age_band.
-    #   5. Build dim_accounts with surrogate keys; rename customer_ref → customer_id.
-    #   6. Build fact_transactions, resolving account_sk and customer_sk via joins.
-    #   7. Write all three Gold tables as Delta Parquet.
-    #   8. (Stage 2+) Write dq_report.json to /data/output/.
-    pass
+    config = load_config()
+    stage = infer_stage(config)
+    spark = spark_session(config)
+    silver_root = output_path(config, "silver")
+    gold_root = output_path(config, "gold")
+
+    customers = read_delta(spark, f"{silver_root}/customers")
+    accounts = read_delta(spark, f"{silver_root}/accounts")
+    transactions = read_delta(spark, f"{silver_root}/transactions")
+
+    dim_customers = _with_surrogate_key(customers, "customer_id", "customer_sk").select(
+        "customer_sk",
+        "customer_id",
+        "gender",
+        "province",
+        "income_band",
+        "segment",
+        "risk_score",
+        "kyc_status",
+        _age_band(F.col("dob")).alias("age_band"),
+    )
+
+    dim_accounts = _with_surrogate_key(accounts, "account_id", "account_sk").select(
+        "account_sk",
+        "account_id",
+        F.col("customer_ref").alias("customer_id"),
+        "account_type",
+        "account_status",
+        "open_date",
+        "product_tier",
+        "digital_channel",
+        "credit_limit",
+        "current_balance",
+        "last_activity_date",
+    )
+
+    account_customer = dim_accounts.join(
+        dim_customers.select("customer_id", "customer_sk", F.col("province").alias("customer_province")),
+        "customer_id",
+        "inner",
+    )
+
+    fact_base = transactions.join(
+        account_customer.select("account_id", "account_sk", "customer_sk", "customer_province"),
+        "account_id",
+        "inner",
+    )
+    fact_transactions = _with_surrogate_key(fact_base, "transaction_id", "transaction_sk").select(
+        "transaction_sk",
+        "transaction_id",
+        "account_sk",
+        "customer_sk",
+        "transaction_date",
+        "transaction_timestamp",
+        "transaction_type",
+        "merchant_category",
+        "merchant_subcategory",
+        "amount",
+        "currency",
+        "channel",
+        F.coalesce(F.col("customer_province"), F.col("province")).alias("province"),
+        "dq_flag",
+        "ingestion_timestamp",
+    )
+
+    write_delta(dim_customers, f"{gold_root}/dim_customers")
+    write_delta(dim_accounts, f"{gold_root}/dim_accounts")
+    write_delta(fact_transactions, f"{gold_root}/fact_transactions")
+
+    set_gold_count("dim_customers", dim_customers.count())
+    set_gold_count("dim_accounts", dim_accounts.count())
+    set_gold_count("fact_transactions", fact_transactions.count())
+    _write_report_if_needed(config, stage)

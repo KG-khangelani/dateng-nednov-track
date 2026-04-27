@@ -1,38 +1,37 @@
-"""
-Bronze layer: Ingest raw source data into Delta Parquet tables.
+from pyspark.sql import functions as F
 
-Input paths (read-only mounts — do not write here):
-  /data/input/accounts.csv
-  /data/input/transactions.jsonl
-  /data/input/customers.csv
+from pipeline.common import RUN_TIMESTAMP, load_config, output_path, raw_transaction_frame, spark_session, write_delta
+from pipeline.metrics import set_source_count
 
-Output paths (your pipeline must create these directories):
-  /data/output/bronze/accounts/
-  /data/output/bronze/transactions/
-  /data/output/bronze/customers/
 
-Requirements:
-  - Preserve source data as-is; do not transform at this layer.
-  - Add an `ingestion_timestamp` column (TIMESTAMP) recording when each
-    record entered the Bronze layer. Use a consistent timestamp for the
-    entire ingestion run (not per-row).
-  - Write each table as a Delta Parquet table (not plain Parquet).
-  - Read paths from config/pipeline_config.yaml — do not hardcode paths.
-  - All paths are absolute inside the container (e.g. /data/input/accounts.csv).
+def _run_timestamp_col():
+    return F.to_timestamp(F.lit(RUN_TIMESTAMP.replace("Z", "")))
 
-Spark configuration tip:
-  Run Spark in local[2] mode to stay within the 2-vCPU resource constraint.
-  Configure Delta Lake using the builder pattern shown in the base image docs.
-"""
+
+def _read_csv_raw(spark, path):
+    return (
+        spark.read.option("header", "true")
+        .option("inferSchema", "false")
+        .option("mode", "PERMISSIVE")
+        .csv(path)
+    )
 
 
 def run_ingestion():
-    # TODO: Implement Bronze layer ingestion.
-    #
-    # Suggested steps:
-    #   1. Load pipeline_config.yaml to get input/output paths.
-    #   2. Initialise a SparkSession with Delta Lake support (local[2]).
-    #   3. Read accounts.csv → append ingestion_timestamp → write to bronze/accounts/.
-    #   4. Read transactions.jsonl → append ingestion_timestamp → write to bronze/transactions/.
-    #   5. Read customers.csv → append ingestion_timestamp → write to bronze/customers/.
-    pass
+    config = load_config()
+    spark = spark_session(config)
+    input_config = config["input"]
+    ingestion_ts = _run_timestamp_col()
+
+    accounts = _read_csv_raw(spark, input_config["accounts_path"]).withColumn("ingestion_timestamp", ingestion_ts)
+    customers = _read_csv_raw(spark, input_config["customers_path"]).withColumn("ingestion_timestamp", ingestion_ts)
+    transactions = raw_transaction_frame(spark, input_config["transactions_path"], ingestion_ts)
+
+    set_source_count("accounts_raw", accounts.count())
+    set_source_count("customers_raw", customers.count())
+    set_source_count("transactions_raw", transactions.count())
+
+    write_delta(accounts, output_path(config, "bronze", "accounts"))
+    write_delta(customers, output_path(config, "bronze", "customers"))
+    write_delta(transactions, output_path(config, "bronze", "transactions"))
+

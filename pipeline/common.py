@@ -217,7 +217,7 @@ def _configured_output_partitions(path):
     return default
 
 
-def write_delta(df, path, mode="overwrite"):
+def write_delta(df, path, mode="overwrite", partition_by=None):
     started_at = time.time()
     status = "ok"
     error = None
@@ -226,12 +226,10 @@ def write_delta(df, path, mode="overwrite"):
     if output_partitions > 0:
         df = df.coalesce(output_partitions)
     try:
-        (
-            df.write.format("delta")
-            .mode(mode)
-            .option("overwriteSchema", "true")
-            .save(path)
-        )
+        writer = df.write.format("delta").mode(mode).option("overwriteSchema", "true")
+        if partition_by:
+            writer = writer.partitionBy(*partition_by)
+        writer.save(path)
         metrics = _latest_delta_operation_metrics(path)
         return metrics
     except Exception as exc:
@@ -246,6 +244,8 @@ def write_delta(df, path, mode="overwrite"):
             "duration_seconds": round(time.time() - started_at, 3),
             "output_partitions": output_partitions,
         }
+        if partition_by:
+            entry["partition_by"] = list(partition_by)
         if metrics:
             entry["operation_metrics"] = metrics
         if error:

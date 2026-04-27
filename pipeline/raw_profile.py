@@ -68,7 +68,7 @@ def load_credibility_rules(config=None):
 
 def _settings(rules):
     profile = rules.get("profile") or {}
-    mode = str(profile.get("mode", "light")).strip().lower()
+    mode = str(os.environ.get("CREDIBILITY_PROFILE_MODE", profile.get("mode", "light"))).strip().lower()
     if mode not in {"light", "full", "off"}:
         mode = "light"
     return {
@@ -548,6 +548,7 @@ def _light_profile(rules, settings, duration_seconds):
         "source_record_counts": METRICS.get("source_record_counts", {}),
         "tables": raw_profile.get("tables", {}),
         "cross_table": raw_profile.get("cross_table", {}),
+        "adaptive_chunking": raw_profile.get("adaptive_chunking", {}),
         "performance_observation": {
             "profiling_duration_seconds": duration_seconds,
             "section_duration_seconds": raw_profile.get("section_duration_seconds", {}),

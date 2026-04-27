@@ -20,6 +20,11 @@ The top-level flow is deterministic and non-interactive:
 4. `run_raw_profile()` light audit JSON write when `profile.mode: light`
 5. `run_provisioning()`
 
+`runtime.mode: scorer` is the default and follows that path. `runtime.mode:
+adaptive` is opt-in for larger local runs; it preflights input size and Docker
+limits, then uses resumable transaction hash buckets only when the derived tier
+is `large`.
+
 No prompts or stdin reads are allowed in the scoring container (no TTY attached).
 
 ## 2) Data sources and expected outputs
@@ -45,6 +50,7 @@ Your pipeline must write to the exact output roots below:
 - `/data/output/dq_report.json` (Stage 2+)
 - `/data/output/audit/raw_anomaly_profile.json` (audit-only, not scorer-facing)
 - `/data/output/audit/performance_profile.json` (audit-only phase timing)
+- `/data/output/audit/chunk_manifest.json` (adaptive mode only)
 - `/data/output/stream_gold/` (Stage 3)
 
 Raw anomaly profiling is controlled by `config/credibility_rules.yaml`:

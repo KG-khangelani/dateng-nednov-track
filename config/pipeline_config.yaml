@@ -63,6 +63,15 @@ credibility:
 performance:
   profile_path: /data/output/audit/performance_profile.json
 
+# Runtime mode stays scorer by default for the automated contract. Adaptive
+# mode is opt-in for larger local runs that need resumable transaction buckets.
+runtime:
+  mode: scorer
+  adaptive:
+    max_bucket_bytes: 268435456
+    max_bucket_count: 256
+    manifest_path: /data/output/audit/chunk_manifest.json
+
 # Table-aware Delta output sizing. Small dimensions stay compact while
 # transaction-scale outputs keep enough parallelism for 2 vCPU execution.
 delta:

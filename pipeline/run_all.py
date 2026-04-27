@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from pipeline.common import (
     load_config,
     spark_session,
 )
+from pipeline.adaptive import build_preflight_plan, is_adaptive_large, run_adaptive_pipeline
 from pipeline.ingest import run_ingestion
 from pipeline.provision import run_provisioning
 from pipeline.raw_profile import raw_profile_mode, run_raw_profile
@@ -32,7 +34,7 @@ def _read_cpu_stat():
     try:
         lines = Path("/sys/fs/cgroup/cpu.stat").read_text(encoding="utf-8").splitlines()
     except (FileNotFoundError, OSError):
-        return {}
+        lines = []
     stats = {}
     for line in lines:
         parts = line.split()
@@ -41,6 +43,25 @@ def _read_cpu_stat():
                 stats[parts[0]] = int(parts[1])
             except ValueError:
                 pass
+    if stats:
+        return stats
+
+    usage_ns = _read_int("/sys/fs/cgroup/cpuacct/cpuacct.usage")
+    if usage_ns is not None:
+        stats["usage_usec"] = int(usage_ns / 1000)
+    try:
+        lines = Path("/sys/fs/cgroup/cpu/cpu.stat").read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, OSError):
+        lines = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) == 2 and parts[0] in {"nr_throttled", "throttled_time"}:
+            try:
+                stats[parts[0]] = int(parts[1])
+            except ValueError:
+                pass
+    if "throttled_time" in stats and "throttled_usec" not in stats:
+        stats["throttled_usec"] = int(stats["throttled_time"] / 1000)
     return stats
 
 
@@ -50,15 +71,22 @@ def _cpu_quota_cores():
         if quota != "max":
             return round(int(quota) / int(period), 2)
     except (FileNotFoundError, OSError, ValueError):
-        return None
+        pass
+    quota = _read_int("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+    period = _read_int("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    if quota and quota > 0 and period:
+        return round(quota / period, 2)
     return None
 
 
 def _resource_snapshot():
     return {
-        "memory_current_bytes": _read_int("/sys/fs/cgroup/memory.current"),
-        "memory_peak_bytes": _read_int("/sys/fs/cgroup/memory.peak"),
-        "memory_limit_bytes": _read_int("/sys/fs/cgroup/memory.max"),
+        "memory_current_bytes": _read_int("/sys/fs/cgroup/memory.current")
+        or _read_int("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+        "memory_peak_bytes": _read_int("/sys/fs/cgroup/memory.peak")
+        or _read_int("/sys/fs/cgroup/memory/memory.max_usage_in_bytes"),
+        "memory_limit_bytes": _read_int("/sys/fs/cgroup/memory.max")
+        or _read_int("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
         "cpu_quota_cores": _cpu_quota_cores(),
         "cpu_stat": _read_cpu_stat(),
     }
@@ -129,26 +157,50 @@ def _time_phase(profile, name, func, allow_failure=False):
 
 def main():
     config = load_config()
+    preflight = build_preflight_plan(config)
     profile = {
         "$schema": "nedbank-de-challenge/performance-profile/v1",
         "run_timestamp": RUN_TIMESTAMP,
         "phases": [],
         "resource_start": _resource_snapshot(),
+        "preflight": preflight,
     }
-    spark = _time_phase(profile, "spark_session_init", lambda: spark_session(config))
-    profile_mode = raw_profile_mode(config)
+    spark = None
     try:
-        _time_phase(profile, "ingest", run_ingestion)
-        if profile_mode == "full":
-            _time_phase(profile, "raw_profile_full", run_raw_profile, allow_failure=True)
-        _time_phase(profile, "transform", run_transformation)
-        if profile_mode == "light":
-            _time_phase(profile, "raw_profile_light", run_raw_profile, allow_failure=True)
-        _time_phase(profile, "provision", run_provisioning)
-        if infer_stage(config) == "3":
-            _time_phase(profile, "stream_ingest", run_stream_ingestion)
+        if not preflight.get("safe_to_run", True):
+            raise RuntimeError(preflight.get("failure_reason") or "preflight rejected adaptive run")
+
+        spark = _time_phase(profile, "spark_session_init", lambda: spark_session(config))
+        profile_mode = raw_profile_mode(config)
+        if is_adaptive_large(preflight):
+            if profile_mode == "full":
+                os.environ["CREDIBILITY_PROFILE_MODE"] = "light"
+                profile["raw_profile_mode_override"] = {
+                    "requested": "full",
+                    "applied": "light",
+                    "reason": "adaptive large runs keep advisory profiling aggregate-only",
+                }
+                profile_mode = "light"
+            adaptive_result = _time_phase(profile, "adaptive_pipeline", lambda: run_adaptive_pipeline(preflight))
+            profile["adaptive_result"] = {
+                "finalized": bool((adaptive_result or {}).get("finalized")),
+                "resume_action": (adaptive_result or {}).get("_resume_action"),
+            }
+            if profile_mode == "light" and (adaptive_result or {}).get("_resume_action") != "already_finalized":
+                _time_phase(profile, "raw_profile_light", run_raw_profile, allow_failure=True)
+        else:
+            _time_phase(profile, "ingest", run_ingestion)
+            if profile_mode == "full":
+                _time_phase(profile, "raw_profile_full", run_raw_profile, allow_failure=True)
+            _time_phase(profile, "transform", run_transformation)
+            if profile_mode == "light":
+                _time_phase(profile, "raw_profile_light", run_raw_profile, allow_failure=True)
+            _time_phase(profile, "provision", run_provisioning)
+            if infer_stage(config) == "3":
+                _time_phase(profile, "stream_ingest", run_stream_ingestion)
     finally:
-        _time_phase(profile, "spark_stop", spark.stop)
+        if spark is not None:
+            _time_phase(profile, "spark_stop", spark.stop)
         _time_phase(profile, "cleanup_spark_local_dir", lambda: cleanup_spark_local_dir(config))
         _write_performance_profile(config, profile)
 

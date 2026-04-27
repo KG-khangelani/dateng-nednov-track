@@ -285,12 +285,12 @@ dim_accounts
 dim_customers]
 
     E[python pipeline/run_all.py
-(non-interactive)] --> B
+non-interactive] --> B
     E --> C
     E --> D
 
     C -. Stage 2+ .-> F[/data/output/dq_report.json/]
-    G[/data/stream/* (Stage 3)/] -. Stage 3 .-> H[stream_gold
+    G[/data/stream/* - Stage 3/] -. Stage 3 .-> H[stream_gold
 current_balances
 recent_transactions]
 ```
@@ -299,12 +299,12 @@ recent_transactions]
 
 ```mermaid
 flowchart LR
-    subgraph BatchPath[Batch path (must continue to pass)]
+        subgraph BatchPath[Batch path - must continue to pass]
       I[input batch files] --> J[Bronze] --> K[Silver] --> L[Gold]
     end
 
-    subgraph StreamingPath[Streaming extension (Stage 3)]
-      M[/data/stream micro-batches] --> N[Polling + incremental processing] --> O[/data/output/stream_gold]
+        subgraph StreamingPath[Streaming extension - Stage 3]
+            M["/data/stream micro-batches"] --> N[Polling and incremental processing] --> O["/data/output/stream_gold"]
     end
 
     BatchPath --- StreamingPath

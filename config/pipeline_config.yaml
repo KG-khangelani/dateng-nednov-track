@@ -57,3 +57,7 @@ spark:
 # the scorer contract and must not change Gold records or dq_report.json.
 credibility:
   rules_path: /data/config/credibility_rules.yaml
+
+# Audit-only timing profile for container lifetime and phase-level runtime.
+performance:
+  profile_path: /data/output/audit/performance_profile.json

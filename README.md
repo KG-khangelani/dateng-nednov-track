@@ -43,6 +43,7 @@ Your pipeline must write to the exact output roots below:
 - `/data/output/gold/`
 - `/data/output/dq_report.json` (Stage 2+)
 - `/data/output/audit/raw_anomaly_profile.json` (audit-only, not scorer-facing)
+- `/data/output/audit/performance_profile.json` (audit-only phase timing)
 - `/data/output/stream_gold/` (Stage 3)
 
 Gold tables expected by validation queries:

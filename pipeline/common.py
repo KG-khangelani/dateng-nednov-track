@@ -15,6 +15,7 @@ from pyspark.sql import types as T
 
 RUN_STARTED_AT = time.time()
 RUN_TIMESTAMP = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+DELTA_WRITE_METRICS = []
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = "/data/config/pipeline_config.yaml"
@@ -187,16 +188,39 @@ def metric_int(metrics, name, default=0):
 
 
 def write_delta(df, path, mode="overwrite"):
+    started_at = time.time()
+    status = "ok"
+    error = None
+    metrics = {}
     output_partitions = int(os.environ.get("DELTA_OUTPUT_PARTITIONS", "4"))
     if output_partitions > 0:
         df = df.coalesce(output_partitions)
-    (
-        df.write.format("delta")
-        .mode(mode)
-        .option("overwriteSchema", "true")
-        .save(path)
-    )
-    return _latest_delta_operation_metrics(path)
+    try:
+        (
+            df.write.format("delta")
+            .mode(mode)
+            .option("overwriteSchema", "true")
+            .save(path)
+        )
+        metrics = _latest_delta_operation_metrics(path)
+        return metrics
+    except Exception as exc:
+        status = "failed"
+        error = str(exc)
+        raise
+    finally:
+        entry = {
+            "path": path,
+            "mode": mode,
+            "status": status,
+            "duration_seconds": round(time.time() - started_at, 3),
+            "output_partitions": output_partitions,
+        }
+        if metrics:
+            entry["operation_metrics"] = metrics
+        if error:
+            entry["error"] = error
+        DELTA_WRITE_METRICS.append(entry)
 
 
 def read_delta(spark, path):

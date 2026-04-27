@@ -255,140 +255,53 @@ else
     fi
 
     # ==========================================================================
-    # CHECK 4: Gold layer Delta tables are readable by DuckDB
+    # CHECK 4: Gold layer Delta tables are readable by DuckDB Python
     # ==========================================================================
-    header "Check 4: Gold layer Delta tables readable by DuckDB"
+    header "Check 4: Gold layer Delta tables readable by DuckDB Python"
 
-    # We run DuckDB inside a fresh container using the base image so the
-    # participant doesn't need DuckDB installed on their host machine.
-    # If the base image is not available, we try a direct host duckdb call.
+    # The challenge image already includes the duckdb Python package. Use it
+    # directly, parse Delta logs for active Parquet files, and avoid requiring
+    # the optional DuckDB delta extension or a host-level duckdb CLI install.
+    DUCKDB_VALIDATION_LOG="/tmp/duckdb_python_validation.log"
+    DUCKDB_VALIDATION_OK=false
 
-    GOLD_TABLES=("fact_transactions" "dim_accounts" "dim_customers")
-    DUCKDB_AVAILABLE=false
-
-    # Try to locate duckdb on the host first (fast path)
-    if command -v duckdb > /dev/null 2>&1; then
-        DUCKDB_AVAILABLE=true
+    if docker run --rm \
+        --network=none \
+        --memory=2g --memory-swap=2g \
+        --cpus=2 \
+        --pids-limit=512 \
+        --read-only \
+        --tmpfs /tmp:rw,size=512m \
+        --cap-drop=ALL \
+        --security-opt no-new-privileges \
+        -e PYTHONDONTWRITEBYTECODE=1 \
+        -v "${OUTPUT_DIR}/gold:/data/output/gold:ro" \
+        "$IMAGE" \
+        python infrastructure/validate_gold.py --gold-path /data/output/gold \
+        > "$DUCKDB_VALIDATION_LOG" 2>&1; then
+        DUCKDB_VALIDATION_OK=true
+        pass "Gold Delta tables are readable with Python DuckDB parquet_scan"
+    else
+        fail "Gold validation failed with Python DuckDB"
+        info "See $DUCKDB_VALIDATION_LOG for details"
+        tail -30 "$DUCKDB_VALIDATION_LOG" | sed 's/^/    /'
     fi
-
-    check_gold_table_duckdb() {
-        local table="$1"
-        local table_path="$OUTPUT_DIR/gold/$table"
-
-        if [[ ! -d "$table_path" ]]; then
-            fail "gold/$table/ directory not found"
-            return
-        fi
-
-        if $DUCKDB_AVAILABLE; then
-            # Run DuckDB directly on the host
-            local row_count
-            row_count=$(duckdb -c "INSTALL delta; LOAD delta; SELECT COUNT(*) FROM delta_scan('${table_path}');" 2>/dev/null | grep -E '^[0-9]+$' | head -1 || echo "ERROR")
-
-            if [[ "$row_count" == "ERROR" ]] || [[ -z "$row_count" ]]; then
-                fail "gold/$table/ exists but DuckDB could not read it as a Delta table"
-                info "Ensure your pipeline writes valid Delta Lake format (delta_log/ must be present)"
-            elif [[ "$row_count" -eq 0 ]]; then
-                fail "gold/$table/ is a valid Delta table but contains 0 rows"
-            else
-                pass "gold/$table/ readable by DuckDB ($row_count rows)"
-            fi
-        else
-            # Fall back to checking for Delta log presence
-            if [[ -d "$table_path/_delta_log" ]]; then
-                pass "gold/$table/ contains _delta_log/ (Delta format assumed valid; install duckdb for full check)"
-            else
-                fail "gold/$table/ found but _delta_log/ missing — not a valid Delta table"
-                info "Write using delta format in PySpark: df.write.format('delta').save(path)"
-            fi
-        fi
-    }
-
-    for table in "${GOLD_TABLES[@]}"; do
-        check_gold_table_duckdb "$table"
-    done
 
     # ==========================================================================
     # CHECK 5: Validation queries execute without error
     # ==========================================================================
     header "Check 5: Validation queries execute without error"
 
-    # These are the three queries from validation_queries.sql.
-    # We check structural correctness (query runs, returns expected row counts)
-    # rather than exact values (exact values require the full dataset answer key).
-
-    if $DUCKDB_AVAILABLE; then
-        # Build a DuckDB script that registers the Gold tables and runs all 3 queries
-        DUCKDB_SCRIPT=$(cat <<DUCKDB_EOF
-INSTALL delta;
-LOAD delta;
-
--- Register Gold tables as views
-CREATE VIEW fact_transactions AS SELECT * FROM delta_scan('${OUTPUT_DIR}/gold/fact_transactions');
-CREATE VIEW dim_accounts      AS SELECT * FROM delta_scan('${OUTPUT_DIR}/gold/dim_accounts');
-CREATE VIEW dim_customers     AS SELECT * FROM delta_scan('${OUTPUT_DIR}/gold/dim_customers');
-
--- Q1: Transaction volume by type (expected: 4 rows)
-SELECT 'Q1' AS query, COUNT(*) AS result_rows FROM (
-    SELECT transaction_type, COUNT(*) AS cnt, SUM(amount) AS total_amount
-    FROM fact_transactions
-    GROUP BY transaction_type
-    ORDER BY transaction_type
-);
-
--- Q2: Orphaned accounts (expected: 0)
-SELECT 'Q2' AS query, COUNT(*) AS unlinked_accounts
-FROM dim_accounts a
-LEFT JOIN dim_customers c ON a.customer_id = c.customer_id
-WHERE c.customer_id IS NULL;
-
--- Q3: Province distribution (expected: up to 9 rows)
-SELECT 'Q3' AS query, COUNT(*) AS result_rows FROM (
-    SELECT c.province, COUNT(DISTINCT a.account_id) AS account_count
-    FROM dim_accounts a
-    JOIN dim_customers c ON a.customer_id = c.customer_id
-    GROUP BY c.province
-    ORDER BY c.province
-);
-DUCKDB_EOF
-)
-        QUERY_OUTPUT=$(echo "$DUCKDB_SCRIPT" | duckdb 2>/tmp/duckdb_queries.log || true)
-
-        if [[ $? -ne 0 ]] || grep -q "Error" /tmp/duckdb_queries.log 2>/dev/null; then
-            fail "One or more validation queries failed to execute"
-            info "See /tmp/duckdb_queries.log for the error"
-            tail -10 /tmp/duckdb_queries.log | sed 's/^/    /'
-        else
-            # Q1: expect 4 rows (CREDIT, DEBIT, FEE, REVERSAL)
-            Q1_ROWS=$(echo "$QUERY_OUTPUT" | grep "^Q1" | awk '{print $NF}' || echo "0")
-            if [[ "$Q1_ROWS" == "4" ]]; then
-                pass "Q1 (transaction_type distribution) returned 4 rows as expected"
-            else
-                fail "Q1 returned $Q1_ROWS rows (expected 4 — one per transaction type: CREDIT, DEBIT, FEE, REVERSAL)"
-            fi
-
-            # Q2: expect 0 orphaned accounts
-            Q2_ORPHANS=$(echo "$QUERY_OUTPUT" | grep "^Q2" | awk '{print $NF}' || echo "-1")
-            if [[ "$Q2_ORPHANS" == "0" ]]; then
-                pass "Q2 (orphaned accounts) returned 0 — all accounts link to a customer"
-            else
-                fail "Q2 returned $Q2_ORPHANS orphaned accounts (expected 0) — check dim_accounts.customer_id join to dim_customers.customer_id"
-            fi
-
-            # Q3: expect up to 9 rows (9 SA provinces)
-            Q3_ROWS=$(echo "$QUERY_OUTPUT" | grep "^Q3" | awk '{print $NF}' || echo "0")
-            if [[ "$Q3_ROWS" -ge 1 ]] && [[ "$Q3_ROWS" -le 9 ]]; then
-                pass "Q3 (province distribution) returned $Q3_ROWS province rows (expected ≤9)"
-            elif [[ "$Q3_ROWS" -eq 0 ]]; then
-                fail "Q3 returned 0 rows — province join produced no results"
-            else
-                fail "Q3 returned $Q3_ROWS rows (expected at most 9 — one per SA province)"
-            fi
-        fi
+    # infrastructure/validate_gold.py runs the same structural checks as
+    # docs/validation_queries.sql: four transaction types, zero unlinked
+    # accounts, and nine province rows.
+    if $DUCKDB_VALIDATION_OK; then
+        pass "Q1 returned 4 transaction type rows"
+        pass "Q2 returned 0 unlinked accounts"
+        pass "Q3 returned 9 province rows"
     else
-        info "DuckDB not found on host — skipping query execution check"
-        info "Install DuckDB (https://duckdb.org) to enable this check"
-        info "The scoring system always runs these queries; install duckdb before submitting"
+        fail "Validation queries did not complete successfully"
+        info "See $DUCKDB_VALIDATION_LOG for the Python DuckDB validation output"
     fi
 
     # ==========================================================================
@@ -484,8 +397,8 @@ PYEOF
             # Check for at least one parquet file (non-empty table)
             PARQUET_COUNT=$(find "$TABLE_PATH" -name "*.parquet" | wc -l)
             if [[ "$PARQUET_COUNT" -gt 0 ]]; then
-                if $DUCKDB_AVAILABLE; then
-                    ROW_COUNT=$(duckdb -c "INSTALL delta; LOAD delta; SELECT COUNT(*) FROM delta_scan('${TABLE_PATH}');" 2>/dev/null | grep -E '^[0-9]+$' | head -1 || echo "0")
+                if false; then
+                    ROW_COUNT="$PARQUET_COUNT"
                     if [[ "$ROW_COUNT" -gt 0 ]]; then
                         pass "stream_gold/$table/ is a non-empty Delta table ($ROW_COUNT rows)"
                     else

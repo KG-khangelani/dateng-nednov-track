@@ -1,5 +1,6 @@
 profile:
   enabled: true
+  mode: light
   output_path: /data/output/audit/raw_anomaly_profile.json
   top_k: 5
   enable_top_k: true

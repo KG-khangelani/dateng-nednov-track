@@ -13,7 +13,7 @@ from pipeline.common import (
 )
 from pipeline.ingest import run_ingestion
 from pipeline.provision import run_provisioning
-from pipeline.raw_profile import run_raw_profile
+from pipeline.raw_profile import raw_profile_mode, run_raw_profile
 from pipeline.stream_ingest import run_stream_ingestion
 from pipeline.transform import run_transformation
 
@@ -136,10 +136,14 @@ def main():
         "resource_start": _resource_snapshot(),
     }
     spark = _time_phase(profile, "spark_session_init", lambda: spark_session(config))
+    profile_mode = raw_profile_mode(config)
     try:
         _time_phase(profile, "ingest", run_ingestion)
-        _time_phase(profile, "raw_profile", run_raw_profile, allow_failure=True)
+        if profile_mode == "full":
+            _time_phase(profile, "raw_profile_full", run_raw_profile, allow_failure=True)
         _time_phase(profile, "transform", run_transformation)
+        if profile_mode == "light":
+            _time_phase(profile, "raw_profile_light", run_raw_profile, allow_failure=True)
         _time_phase(profile, "provision", run_provisioning)
         if infer_stage(config) == "3":
             _time_phase(profile, "stream_ingest", run_stream_ingestion)

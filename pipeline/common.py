@@ -112,7 +112,7 @@ def _spark_local_dir(config):
     configured = spark_config.get("local_dir") or os.environ.get("SPARK_LOCAL_DIR")
     if configured:
         return configured, False
-    if Path("/data/output").exists():
+    if Path("/data/output").exists() and os.access("/data/output", os.W_OK):
         return "/data/output/_spark_tmp", True
     return "/tmp", False
 
@@ -135,6 +135,7 @@ def spark_session(config=None):
     if not Path(os.environ.get("SPARK_HOME", "")).exists():
         os.environ["SPARK_HOME"] = pyspark_home
     spark_config = config.get("spark", {})
+    parquet_compression = os.environ.get("SPARK_PARQUET_COMPRESSION") or spark_config.get("parquet_compression", "snappy")
     spark_local_dir, _ = _spark_local_dir(config)
     builder = (
         SparkSession.builder.appName(spark_config.get("app_name", "nedbank-de-pipeline"))
@@ -150,7 +151,7 @@ def spark_session(config=None):
         .config("spark.default.parallelism", os.environ.get("SPARK_DEFAULT_PARALLELISM", "4"))
         .config("spark.sql.files.maxPartitionBytes", os.environ.get("SPARK_MAX_PARTITION_BYTES", "67108864"))
         .config("spark.sql.autoBroadcastJoinThreshold", os.environ.get("SPARK_AUTO_BROADCAST_THRESHOLD", "67108864"))
-        .config("spark.sql.parquet.compression.codec", os.environ.get("SPARK_PARQUET_COMPRESSION", "uncompressed"))
+        .config("spark.sql.parquet.compression.codec", parquet_compression)
         .config("spark.sql.adaptive.enabled", os.environ.get("SPARK_SQL_ADAPTIVE", "true"))
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
     )
@@ -187,12 +188,41 @@ def metric_int(metrics, name, default=0):
         return default
 
 
+def _configured_output_partitions(path):
+    env_value = os.environ.get("DELTA_OUTPUT_PARTITIONS")
+    if env_value is not None:
+        return int(env_value)
+
+    try:
+        config = load_config()
+    except FileNotFoundError:
+        config = {}
+
+    partition_config = ((config.get("delta") or {}).get("output_partitions") or {})
+    default = int(partition_config.get("default", 4))
+    normalized = str(path).replace("\\", "/").rstrip("/")
+    parts = [part for part in normalized.split("/") if part]
+
+    for layer in ("bronze", "silver", "gold", "stream_gold"):
+        if layer not in parts:
+            continue
+        layer_index = parts.index(layer)
+        table = parts[layer_index + 1] if layer_index + 1 < len(parts) else None
+        layer_config = partition_config.get(layer)
+        if isinstance(layer_config, dict) and table in layer_config:
+            return int(layer_config[table])
+        if isinstance(layer_config, int):
+            return int(layer_config)
+
+    return default
+
+
 def write_delta(df, path, mode="overwrite"):
     started_at = time.time()
     status = "ok"
     error = None
     metrics = {}
-    output_partitions = int(os.environ.get("DELTA_OUTPUT_PARTITIONS", "4"))
+    output_partitions = _configured_output_partitions(path)
     if output_partitions > 0:
         df = df.coalesce(output_partitions)
     try:

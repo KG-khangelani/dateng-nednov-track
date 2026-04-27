@@ -37,6 +37,7 @@ from pipeline.credibility import (
     normalized,
     trimmed,
 )
+from pipeline.metrics import METRICS
 
 
 DEFAULT_CREDIBILITY_RULES = "/data/config/credibility_rules.yaml"
@@ -67,8 +68,12 @@ def load_credibility_rules(config=None):
 
 def _settings(rules):
     profile = rules.get("profile") or {}
+    mode = str(profile.get("mode", "light")).strip().lower()
+    if mode not in {"light", "full", "off"}:
+        mode = "light"
     return {
         "enabled": bool(profile.get("enabled", True)),
+        "mode": mode,
         "output_path": profile.get("output_path", DEFAULT_PROFILE_OUTPUT),
         "top_k": int(profile.get("top_k", 5)),
         "enable_top_k": bool(profile.get("enable_top_k", True)),
@@ -80,6 +85,14 @@ def _settings(rules):
         "extreme_amount_threshold": float(profile.get("extreme_amount_threshold", 50000)),
         "extreme_balance_threshold": float(profile.get("extreme_balance_threshold", 250000)),
     }
+
+
+def raw_profile_mode(config=None):
+    rules = load_credibility_rules(config)
+    settings = _settings(rules)
+    if not settings["enabled"]:
+        return "off"
+    return settings["mode"]
 
 
 def _json_safe(value):
@@ -519,14 +532,43 @@ def _write_json(path, report):
         json.dump(_json_safe(report), handle, indent=2, sort_keys=False)
 
 
+def _light_profile(rules, settings, duration_seconds):
+    raw_profile = METRICS.get("raw_profile") or {}
+    return {
+        "$schema": "nedbank-de-challenge/raw-anomaly-profile/v1",
+        "run_timestamp": RUN_TIMESTAMP,
+        "profile_mode": "light_from_pipeline_metrics",
+        "rules_path": rules.get("_rules_path"),
+        "settings": {
+            key: value
+            for key, value in settings.items()
+            if key not in {"output_path"}
+        },
+        "advisory_rule_catalog": advisory_rule_catalog(),
+        "source_record_counts": METRICS.get("source_record_counts", {}),
+        "tables": raw_profile.get("tables", {}),
+        "cross_table": raw_profile.get("cross_table", {}),
+        "performance_observation": {
+            "profiling_duration_seconds": duration_seconds,
+            "section_duration_seconds": raw_profile.get("section_duration_seconds", {}),
+            "cpu_note": "Light mode reuses metrics computed by ingest/transform and does not scan raw tables independently.",
+            "memory_note": "No pandas conversion, row-level raw samples, or top-K domain scans are collected in light mode.",
+        },
+    }
+
+
 def run_raw_profile():
     config = load_config()
     rules = load_credibility_rules(config)
     settings = _settings(rules)
-    if not settings["enabled"]:
+    if not settings["enabled"] or settings["mode"] == "off":
         return
 
     started_at = time.time()
+    if settings["mode"] == "light":
+        _write_json(settings["output_path"], _light_profile(rules, settings, int(time.time() - started_at)))
+        return
+
     spark = spark_session(config)
     bronze_root = output_path(config, "bronze")
     accounts = read_delta(spark, f"{bronze_root}/accounts")
@@ -553,7 +595,7 @@ def run_raw_profile():
     profile = {
         "$schema": "nedbank-de-challenge/raw-anomaly-profile/v1",
         "run_timestamp": RUN_TIMESTAMP,
-        "profile_mode": "rough_aggregate_only",
+        "profile_mode": "full_aggregate_only",
         "rules_path": rules.get("_rules_path"),
         "settings": {
             key: value

@@ -43,6 +43,7 @@ output:
 spark:
   master: local[2]
   app_name: nedbank-de-pipeline
+  parquet_compression: snappy
   # Spark writes temporary files to /tmp. The scoring system provides
   # a 512 MB tmpfs at /tmp — keep intermediate data small.
   # spark.local.dir: /tmp
@@ -61,3 +62,26 @@ credibility:
 # Audit-only timing profile for container lifetime and phase-level runtime.
 performance:
   profile_path: /data/output/audit/performance_profile.json
+
+# Table-aware Delta output sizing. Small dimensions stay compact while
+# transaction-scale outputs keep enough parallelism for 2 vCPU execution.
+delta:
+  output_partitions:
+    default: 4
+    bronze:
+      accounts: 1
+      customers: 1
+      transactions: 4
+    silver:
+      accounts: 1
+      customers: 1
+      transactions: 4
+      quarantine_accounts: 1
+      quarantine_transactions: 4
+    gold:
+      dim_accounts: 1
+      dim_customers: 1
+      fact_transactions: 4
+    stream_gold:
+      current_balances: 1
+      recent_transactions: 4

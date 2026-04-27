@@ -11,12 +11,20 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN python -c "from delta import configure_spark_with_delta_pip; from pyspark.sql import SparkSession; spark = configure_spark_with_delta_pip(SparkSession.builder.master('local[1]').appName('cache-delta-jars').config('spark.sql.extensions','io.delta.sql.DeltaSparkSessionExtension').config('spark.sql.catalog.spark_catalog','org.apache.spark.sql.delta.catalog.DeltaCatalog')).getOrCreate(); spark.stop()"
 RUN mkdir -p /opt/delta-jars && cp /root/.ivy2/jars/*.jar /opt/delta-jars/
+RUN mkdir -p /opt/snappy-java \
+    && cd /opt/snappy-java \
+    && jar xf /usr/local/lib/python3.11/site-packages/pyspark/jars/snappy-java-1.1.10.3.jar org/xerial/snappy/native/Linux/x86_64/libsnappyjava.so \
+    && mv org/xerial/snappy/native/Linux/x86_64/libsnappyjava.so ./libsnappyjava.so \
+    && rm -rf org \
+    && chmod 755 /opt/snappy-java/libsnappyjava.so
+ENV SPARK_SUBMIT_OPTS="-Dorg.xerial.snappy.lib.path=/opt/snappy-java -Dorg.xerial.snappy.lib.name=libsnappyjava.so"
 
 # Copy pipeline code and configuration into the image.
 # Do NOT copy data files or output directories — these are injected at runtime
 # via Docker volume mounts by the scoring system.
 COPY pipeline/ pipeline/
 COPY config/ config/
+COPY infrastructure/validate_gold.py infrastructure/validate_gold.py
 
 # Entry point — must run the complete pipeline end-to-end without interactive input.
 # The scoring system uses this CMD directly; do not require TTY or stdin.

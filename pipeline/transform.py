@@ -1,13 +1,28 @@
+from pyspark import StorageLevel
 from pyspark.sql import Window
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
+from pipeline.credibility import (
+    ACCOUNT_STATUSES,
+    ACCOUNT_TYPES,
+    DIGITAL_CHANNELS,
+    GENDERS,
+    KYC_STATUSES,
+    PRODUCT_TIERS,
+    SA_PROVINCES,
+    TRANSACTION_CHANNELS,
+    TRANSACTION_TYPES,
+    invalid_domain,
+    is_blank,
+)
 from pipeline.common import (
     add_missing_columns,
     currency_variant_flag,
     date_variant_flag,
     load_config,
     load_dq_rules,
+    metric_int,
     normalise_currency,
     output_path,
     parse_date,
@@ -16,7 +31,7 @@ from pipeline.common import (
     spark_session,
     write_delta,
 )
-from pipeline.metrics import METRICS, add_issue
+from pipeline.metrics import METRICS, add_issue, set_raw_profile_section
 
 
 DEFAULT_ACTIONS = {
@@ -45,7 +60,150 @@ def _count_if(predicate):
 
 def _aggregate_metrics(df, **expressions):
     row = df.agg(*[expr.alias(name) for name, expr in expressions.items()]).first()
-    return {name: int(row[name] or 0) for name in expressions}
+    result = {}
+    for name in expressions:
+        value = row[name]
+        if isinstance(value, (list, tuple)):
+            result[name] = [float(item) if item is not None else None for item in value]
+        else:
+            result[name] = int(value or 0)
+    return result
+
+
+def _metric(count, total):
+    count = int(count or 0)
+    total = int(total or 0)
+    return {
+        "count": count,
+        "pct": round(count * 100.0 / total, 2) if total else 0.0,
+    }
+
+
+def _dedupe_transactions_grouped(transactions):
+    order_key = F.struct(
+        F.col("transaction_timestamp").isNull().cast("int").alias("timestamp_is_null"),
+        F.col("transaction_timestamp").alias("transaction_timestamp"),
+        F.col("raw_json").alias("raw_json"),
+    )
+    row_value = F.struct(*[F.col(column).alias(column) for column in transactions.columns])
+    return transactions.groupBy("transaction_id").agg(
+        F.count(F.lit(1)).cast("long").alias("_group_count"),
+        F.min_by(row_value, order_key).alias("_picked"),
+    )
+
+
+def _quarantined_duplicates(transactions, duplicate_ids):
+    duplicate_window = Window.partitionBy("transaction_id").orderBy(
+        F.col("transaction_timestamp").asc_nulls_last(),
+        F.col("raw_json"),
+    )
+    return (
+        transactions.join(F.broadcast(duplicate_ids), "transaction_id", "inner")
+        .withColumn("_rn", F.row_number().over(duplicate_window))
+        .where(F.col("_rn") > 1)
+        .drop("_rn")
+    )
+
+
+def _set_light_raw_profile(
+    source_transactions,
+    source_accounts,
+    source_customers,
+    transaction_metrics,
+    duplicate_count,
+    deduped_metrics,
+    account_metrics,
+    customer_metrics,
+    accounts_output_count,
+):
+    set_raw_profile_section(
+        "tables",
+        {
+            "transactions": {
+                "rows": source_transactions,
+                "duplicate_transaction_surplus": _metric(duplicate_count, source_transactions),
+                "required_nulls": {
+                    "transaction_id": _metric(transaction_metrics["null_transaction_id"], source_transactions),
+                    "account_id": _metric(transaction_metrics["null_transaction_account_id"], source_transactions),
+                    "transaction_date": _metric(transaction_metrics["null_transaction_date"], source_transactions),
+                    "transaction_time": _metric(transaction_metrics["null_transaction_time"], source_transactions),
+                    "amount": _metric(transaction_metrics["null_transaction_amount"], source_transactions),
+                },
+                "amount_quality": {
+                    "parse_failed": _metric(transaction_metrics["amount_cast_failed_count"], source_transactions),
+                    "type_mismatch_or_parse_failed": _metric(transaction_metrics["type_count"], source_transactions),
+                    "negative": _metric(transaction_metrics["negative_amount_count"], source_transactions),
+                    "zero": _metric(transaction_metrics["zero_amount_count"], source_transactions),
+                    "above_configured_extreme_threshold": _metric(transaction_metrics["extreme_amount_count"], source_transactions),
+                    "quantiles": transaction_metrics.get("amount_quantiles", []),
+                },
+                "domain_quality": {
+                    "invalid_transaction_type": _metric(transaction_metrics["invalid_transaction_type_count"], source_transactions),
+                    "invalid_channel": _metric(transaction_metrics["invalid_channel_count"], source_transactions),
+                    "currency_variant": _metric(transaction_metrics["currency_count"], source_transactions),
+                    "invalid_currency": _metric(transaction_metrics["invalid_currency_count"], source_transactions),
+                    "invalid_province": _metric(transaction_metrics["invalid_transaction_province_count"], source_transactions),
+                },
+                "temporal_quality": {
+                    "date_variant": _metric(transaction_metrics["date_transaction_count"], source_transactions),
+                    "date_parse_failed": _metric(transaction_metrics["transaction_date_parse_failed_count"], source_transactions),
+                },
+            },
+            "accounts": {
+                "rows": source_accounts,
+                "required_nulls": {
+                    "account_id": _metric(account_metrics["null_account_count"], source_accounts),
+                    "customer_ref": _metric(account_metrics["null_customer_ref_count"], source_accounts),
+                },
+                "domain_quality": {
+                    "invalid_account_type": _metric(account_metrics["invalid_account_type_count"], source_accounts),
+                    "invalid_account_status": _metric(account_metrics["invalid_account_status_count"], source_accounts),
+                    "invalid_product_tier": _metric(account_metrics["invalid_product_tier_count"], source_accounts),
+                    "invalid_digital_channel": _metric(account_metrics["invalid_digital_channel_count"], source_accounts),
+                },
+                "temporal_quality": {
+                    "date_variant": _metric(account_metrics["date_account_count"], source_accounts),
+                    "open_date_parse_failed": _metric(account_metrics["open_date_parse_failed_count"], source_accounts),
+                    "last_activity_before_open": _metric(account_metrics["last_activity_before_open_count"], source_accounts),
+                },
+                "numeric_quality": {
+                    "negative_current_balance": _metric(account_metrics["negative_current_balance_count"], source_accounts),
+                    "negative_credit_limit": _metric(account_metrics["negative_credit_limit_count"], source_accounts),
+                    "current_balance_quantiles": account_metrics.get("current_balance_quantiles", []),
+                },
+            },
+            "customers": {
+                "rows": source_customers,
+                "required_nulls": {
+                    "customer_id": _metric(customer_metrics["null_customer_count"], source_customers),
+                },
+                "domain_quality": {
+                    "invalid_gender": _metric(customer_metrics["invalid_gender_count"], source_customers),
+                    "invalid_province": _metric(customer_metrics["invalid_customer_province_count"], source_customers),
+                    "invalid_kyc_status": _metric(customer_metrics["invalid_kyc_status_count"], source_customers),
+                },
+                "temporal_quality": {
+                    "date_variant": _metric(customer_metrics["date_customer_count"], source_customers),
+                    "dob_parse_failed": _metric(customer_metrics["dob_parse_failed_count"], source_customers),
+                },
+                "numeric_quality": {
+                    "risk_score_outside_range": _metric(customer_metrics["risk_score_outside_range_count"], source_customers),
+                    "risk_score_quantiles": customer_metrics.get("risk_score_quantiles", []),
+                },
+            },
+        },
+    )
+    set_raw_profile_section(
+        "cross_table",
+        {
+            "referential_checks_enabled": True,
+            "accounts_with_unknown_customer_ref": _metric(
+                max(source_accounts - account_metrics["null_account_count"] - accounts_output_count, 0),
+                source_accounts,
+            ),
+            "transactions_with_unknown_account_id": _metric(deduped_metrics["orphan_count"], source_transactions),
+        },
+    )
 
 
 def run_transformation():
@@ -67,7 +225,16 @@ def run_transformation():
     customer_metrics = _aggregate_metrics(
         customers,
         source_count=_count_if(F.lit(True)),
+        null_customer_count=_count_if(is_blank(F.col("customer_id"))),
         date_customer_count=_count_if(F.col("dob_date_variant")),
+        dob_parse_failed_count=_count_if(~is_blank(F.col("dob")) & F.col("dob_parsed").isNull()),
+        invalid_gender_count=_count_if(invalid_domain(F.col("gender"), GENDERS)),
+        invalid_customer_province_count=_count_if(invalid_domain(F.col("province"), SA_PROVINCES)),
+        invalid_kyc_status_count=_count_if(invalid_domain(F.col("kyc_status"), KYC_STATUSES)),
+        risk_score_outside_range_count=_count_if(
+            F.col("risk_score").isNotNull() & ((F.col("risk_score") < 1) | (F.col("risk_score") > 10))
+        ),
+        risk_score_quantiles=F.expr("percentile_approx(risk_score, array(0.5, 0.95, 0.99), 100)"),
     )
     date_customer_count = customer_metrics["date_customer_count"]
     customers = _dedupe(customers, "customer_id", ["customer_id"]).select(
@@ -91,6 +258,7 @@ def run_transformation():
         .withColumn("last_activity_date_parsed", parse_date(F.col("last_activity_date")))
         .withColumn("credit_limit", F.col("credit_limit").cast(T.DecimalType(18, 2)))
         .withColumn("current_balance", F.col("current_balance").cast(T.DecimalType(18, 2)))
+        .withColumn("current_balance_double", F.col("current_balance").cast("double"))
         .withColumn(
             "date_variant",
             date_variant_flag(F.col("open_date"))
@@ -102,7 +270,21 @@ def run_transformation():
         accounts,
         source_count=_count_if(F.lit(True)),
         null_account_count=_count_if(account_id_missing),
+        null_customer_ref_count=_count_if(is_blank(F.col("customer_ref"))),
         date_account_count=_count_if(F.col("date_variant")),
+        open_date_parse_failed_count=_count_if(~is_blank(F.col("open_date")) & F.col("open_date_parsed").isNull()),
+        last_activity_before_open_count=_count_if(
+            F.col("last_activity_date_parsed").isNotNull()
+            & F.col("open_date_parsed").isNotNull()
+            & (F.col("last_activity_date_parsed") < F.col("open_date_parsed"))
+        ),
+        invalid_account_type_count=_count_if(invalid_domain(F.col("account_type"), ACCOUNT_TYPES)),
+        invalid_account_status_count=_count_if(invalid_domain(F.col("account_status"), ACCOUNT_STATUSES)),
+        invalid_product_tier_count=_count_if(invalid_domain(F.col("product_tier"), PRODUCT_TIERS)),
+        invalid_digital_channel_count=_count_if(invalid_domain(F.col("digital_channel"), DIGITAL_CHANNELS)),
+        negative_current_balance_count=_count_if(F.col("current_balance") < 0),
+        negative_credit_limit_count=_count_if(F.col("credit_limit") < 0),
+        current_balance_quantiles=F.expr("percentile_approx(current_balance_double, array(0.5, 0.95, 0.99), 100)"),
     )
     null_account_count = account_metrics["null_account_count"]
     date_account_count = account_metrics["date_account_count"]
@@ -124,10 +306,12 @@ def run_transformation():
         F.col("last_activity_date_parsed").alias("last_activity_date"),
         F.col("ingestion_timestamp"),
     )
+    accounts_valid = accounts_valid.persist(StorageLevel.MEMORY_AND_DISK)
 
     transactions = add_missing_columns(transactions_b, {"merchant_subcategory": T.StringType()})
     transactions = (
         transactions.withColumn("amount_decimal", F.col("amount").cast(T.DecimalType(18, 2)))
+        .withColumn("amount_double", F.col("amount_decimal").cast("double"))
         .withColumn("transaction_date_parsed", parse_date(F.col("transaction_date")))
         .withColumn("transaction_timestamp", parse_timestamp(F.col("transaction_date"), F.col("transaction_time")))
         .withColumn("currency_clean", normalise_currency(F.col("currency")))
@@ -138,22 +322,42 @@ def run_transformation():
         .withColumn("currency_variant", currency_variant_flag(F.col("currency")))
     )
 
-    duplicate_window = Window.partitionBy("transaction_id").orderBy(F.col("transaction_timestamp").asc_nulls_last(), F.col("raw_json"))
-    transactions_ranked = transactions.withColumn("_rn", F.row_number().over(duplicate_window))
     transaction_metrics = _aggregate_metrics(
-        transactions_ranked,
+        transactions,
         source_count=_count_if(F.lit(True)),
-        duplicate_count=_count_if(F.col("_rn") > 1),
         type_count=_count_if(F.col("amount_type_mismatch") | F.col("amount_cast_failed")),
+        amount_cast_failed_count=_count_if(F.col("amount_cast_failed")),
+        null_transaction_id=_count_if(is_blank(F.col("transaction_id"))),
+        null_transaction_account_id=_count_if(is_blank(F.col("account_id"))),
+        null_transaction_date=_count_if(is_blank(F.col("transaction_date"))),
+        null_transaction_time=_count_if(is_blank(F.col("transaction_time"))),
+        null_transaction_amount=_count_if(is_blank(F.col("amount"))),
+        negative_amount_count=_count_if(F.col("amount_decimal") < 0),
+        zero_amount_count=_count_if(F.col("amount_decimal") == 0),
+        extreme_amount_count=_count_if(F.col("amount_decimal") > F.lit(50000)),
+        amount_quantiles=F.expr("percentile_approx(amount_double, array(0.5, 0.95, 0.99), 100)"),
         date_transaction_count=_count_if(F.col("transaction_date_variant")),
+        transaction_date_parse_failed_count=_count_if(~is_blank(F.col("transaction_date")) & F.col("transaction_date_parsed").isNull()),
         currency_count=_count_if(F.col("currency_variant")),
+        invalid_currency_count=_count_if(F.col("currency_clean").isNotNull() & (F.col("currency_clean") != "ZAR")),
+        invalid_transaction_type_count=_count_if(invalid_domain(F.col("transaction_type"), TRANSACTION_TYPES)),
+        invalid_channel_count=_count_if(invalid_domain(F.col("channel"), TRANSACTION_CHANNELS)),
+        invalid_transaction_province_count=_count_if(invalid_domain(F.col("province"), SA_PROVINCES)),
+    )
+    transaction_id_counts = transactions.groupBy("transaction_id").agg(F.count(F.lit(1)).cast("long").alias("_group_count"))
+    transaction_group_metrics = _aggregate_metrics(
+        transaction_id_counts,
+        duplicate_count=F.sum(F.col("_group_count") - F.lit(1)).cast("long"),
     )
     source_transactions = METRICS["source_record_counts"].get("transactions_raw", transaction_metrics["source_count"])
     source_accounts = METRICS["source_record_counts"].get("accounts_raw", account_metrics["source_count"])
     source_customers = METRICS["source_record_counts"].get("customers_raw", customer_metrics["source_count"])
     source_all = source_transactions + source_accounts + source_customers
-    duplicate_count = transaction_metrics["duplicate_count"]
-    transactions_deduped = transactions_ranked.where(F.col("_rn") == 1).drop("_rn")
+    duplicate_count = transaction_group_metrics["duplicate_count"]
+    if duplicate_count:
+        transactions_deduped = _dedupe_transactions_grouped(transactions).select("_picked.*")
+    else:
+        transactions_deduped = transactions
 
     required_missing = (
         F.col("transaction_id").isNull()
@@ -223,13 +427,37 @@ def run_transformation():
     add_issue("CURRENCY_VARIANT", currency_count, source_transactions, _action("CURRENCY_VARIANT", rules), deduped_metrics["currency_output_count"])
     add_issue("NULL_REQUIRED", null_account_count, source_accounts, _action("NULL_REQUIRED", rules), 0)
 
-    write_delta(customers, f"{silver_root}/customers")
-    write_delta(accounts_valid, f"{silver_root}/accounts")
-    write_delta(transactions_silver, f"{silver_root}/transactions")
+    try:
+        write_delta(customers, f"{silver_root}/customers")
+        account_write_metrics = write_delta(accounts_valid, f"{silver_root}/accounts")
+        write_delta(transactions_silver, f"{silver_root}/transactions")
 
-    if duplicate_count or orphan_count or null_account_count or bad_required_count:
-        write_delta(
-            transactions_ranked.where(F.col("_rn") > 1).select("raw_json").unionByName(orphaned.select("raw_json"), allowMissingColumns=True).unionByName(bad_required.select("raw_json"), allowMissingColumns=True),
-            f"{silver_root}/quarantine_transactions",
+        _set_light_raw_profile(
+            source_transactions,
+            source_accounts,
+            source_customers,
+            transaction_metrics,
+            duplicate_count,
+            deduped_metrics,
+            account_metrics,
+            customer_metrics,
+            metric_int(account_write_metrics, "numOutputRows"),
         )
-        write_delta(account_quarantine, f"{silver_root}/quarantine_accounts")
+
+        quarantine_transactions = None
+        if duplicate_count:
+            duplicate_ids = transaction_id_counts.where(F.col("_group_count") > 1).select("transaction_id")
+            quarantine_transactions = _quarantined_duplicates(transactions, duplicate_ids).select("raw_json")
+        if orphan_count:
+            orphan_rows = orphaned.select("raw_json")
+            quarantine_transactions = orphan_rows if quarantine_transactions is None else quarantine_transactions.unionByName(orphan_rows, allowMissingColumns=True)
+        if bad_required_count:
+            bad_required_rows = bad_required.select("raw_json")
+            quarantine_transactions = bad_required_rows if quarantine_transactions is None else quarantine_transactions.unionByName(bad_required_rows, allowMissingColumns=True)
+
+        if quarantine_transactions is not None:
+            write_delta(quarantine_transactions, f"{silver_root}/quarantine_transactions")
+        if null_account_count:
+            write_delta(account_quarantine, f"{silver_root}/quarantine_accounts")
+    finally:
+        accounts_valid.unpersist()

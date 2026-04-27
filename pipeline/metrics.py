@@ -2,6 +2,7 @@ METRICS = {
     "source_record_counts": {},
     "dq_issues": {},
     "gold_layer_record_counts": {},
+    "raw_profile": {},
 }
 
 
@@ -11,6 +12,10 @@ def set_source_count(name, value):
 
 def set_gold_count(name, value):
     METRICS["gold_layer_record_counts"][name] = int(value)
+
+
+def set_raw_profile_section(name, value):
+    METRICS["raw_profile"][name] = value
 
 
 def add_issue(issue_type, records_affected, denominator, handling_action, records_in_output):
@@ -38,4 +43,3 @@ def add_issue(issue_type, records_affected, denominator, handling_action, record
 
 def issue_list():
     return list(METRICS["dq_issues"].values())
-

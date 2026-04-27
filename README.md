@@ -15,9 +15,10 @@ This repository implements the DE-track pipeline entry point expected by the sco
 The top-level flow is deterministic and non-interactive:
 
 1. `run_ingestion()`
-2. `run_raw_profile()` audit-only raw anomaly profiling
-3. `run_transformation()`
-4. `run_provisioning()`
+2. `run_raw_profile()` only when `credibility_rules.yaml` sets `profile.mode: full`
+3. `run_transformation()` and light raw-profile metric collection
+4. `run_raw_profile()` light audit JSON write when `profile.mode: light`
+5. `run_provisioning()`
 
 No prompts or stdin reads are allowed in the scoring container (no TTY attached).
 
@@ -45,6 +46,12 @@ Your pipeline must write to the exact output roots below:
 - `/data/output/audit/raw_anomaly_profile.json` (audit-only, not scorer-facing)
 - `/data/output/audit/performance_profile.json` (audit-only phase timing)
 - `/data/output/stream_gold/` (Stage 3)
+
+Raw anomaly profiling is controlled by `config/credibility_rules.yaml`:
+
+- `profile.mode: light` is the default scoring mode. It reuses ingest/transform aggregates and avoids an extra raw-table scan.
+- `profile.mode: full` keeps the richer Bronze scan with capped top-K summaries for investigation runs.
+- `profile.mode: off` disables the advisory profile while leaving the scored outputs unchanged.
 
 Gold tables expected by validation queries:
 
@@ -168,7 +175,7 @@ The required execution command is:
 python pipeline/run_all.py
 ```
 
-`pipeline/run_all.py` orchestrates ingest → raw profile audit → transform → provision in sequence and is the official entry point used by automated scoring.
+`pipeline/run_all.py` orchestrates ingest, optional full raw profiling, transform, default light raw profiling, and provision in sequence. It is the official entry point used by automated scoring.
 
 Operational requirements:
 
@@ -191,24 +198,22 @@ bash infrastructure/run_tests.sh --stage 2 --data-dir /tmp/test-data --image my-
 bash infrastructure/run_tests.sh --stage 3 --data-dir /tmp/test-data --stream-dir /tmp/test-stream --image my-submission:test
 ```
 
-### 6.2 Run SQL validation checks
+### 6.2 Run DuckDB validation checks
 
-Use the provided SQL checks in `docs/validation_queries.sql` against your Gold output.
-
-Quick DuckDB flow:
-
-```sql
-INSTALL delta;
-LOAD delta;
-SET VARIABLE gold_path = '/data/output/gold';
-.read docs/validation_queries.sql
-```
-
-Or from shell:
+The submission image already includes the `duckdb` Python package. Prefer the
+Python validator because it reads Delta tables by parsing `_delta_log/` and
+passing the active Parquet files to `duckdb.parquet_scan`, so it does not need
+the optional DuckDB `delta` extension.
 
 ```bash
-duckdb < docs/validation_queries.sql
+docker run --rm \
+  -v /tmp/test-data/output/gold:/data/output/gold:ro \
+  my-submission:test \
+  python infrastructure/validate_gold.py --gold-path /data/output/gold
 ```
+
+`docs/validation_queries.sql` is still retained as the scorer-facing SQL
+reference for environments that have DuckDB's `delta_scan` extension.
 
 ## 7) Stage-specific operator notes
 

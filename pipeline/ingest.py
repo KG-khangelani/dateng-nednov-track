@@ -1,6 +1,6 @@
 from pyspark.sql import functions as F
 
-from pipeline.common import RUN_TIMESTAMP, load_config, output_path, raw_transaction_frame, spark_session, write_delta
+from pipeline.common import RUN_TIMESTAMP, load_config, metric_int, output_path, raw_transaction_frame, spark_session, write_delta
 from pipeline.metrics import set_source_count
 
 
@@ -27,11 +27,10 @@ def run_ingestion():
     customers = _read_csv_raw(spark, input_config["customers_path"]).withColumn("ingestion_timestamp", ingestion_ts)
     transactions = raw_transaction_frame(spark, input_config["transactions_path"], ingestion_ts)
 
-    set_source_count("accounts_raw", accounts.count())
-    set_source_count("customers_raw", customers.count())
-    set_source_count("transactions_raw", transactions.count())
+    accounts_metrics = write_delta(accounts, output_path(config, "bronze", "accounts"))
+    customers_metrics = write_delta(customers, output_path(config, "bronze", "customers"))
+    transactions_metrics = write_delta(transactions, output_path(config, "bronze", "transactions"))
 
-    write_delta(accounts, output_path(config, "bronze", "accounts"))
-    write_delta(customers, output_path(config, "bronze", "customers"))
-    write_delta(transactions, output_path(config, "bronze", "transactions"))
-
+    set_source_count("accounts_raw", metric_int(accounts_metrics, "numOutputRows"))
+    set_source_count("customers_raw", metric_int(customers_metrics, "numOutputRows"))
+    set_source_count("transactions_raw", metric_int(transactions_metrics, "numOutputRows"))

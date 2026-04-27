@@ -5,6 +5,7 @@ from pipeline.common import (
     execution_seconds,
     infer_stage,
     load_config,
+    metric_int,
     output_path,
     read_delta,
     spark_session,
@@ -95,13 +96,13 @@ def run_provisioning():
     )
 
     account_customer = dim_accounts.join(
-        dim_customers.select("customer_id", "customer_sk", F.col("province").alias("customer_province")),
+        F.broadcast(dim_customers.select("customer_id", "customer_sk", F.col("province").alias("customer_province"))),
         "customer_id",
         "inner",
     )
 
     fact_base = transactions.join(
-        account_customer.select("account_id", "account_sk", "customer_sk", "customer_province"),
+        F.broadcast(account_customer.select("account_id", "account_sk", "customer_sk", "customer_province")),
         "account_id",
         "inner",
     )
@@ -123,11 +124,11 @@ def run_provisioning():
         "ingestion_timestamp",
     )
 
-    write_delta(dim_customers, f"{gold_root}/dim_customers")
-    write_delta(dim_accounts, f"{gold_root}/dim_accounts")
-    write_delta(fact_transactions, f"{gold_root}/fact_transactions")
+    customer_metrics = write_delta(dim_customers, f"{gold_root}/dim_customers")
+    account_metrics = write_delta(dim_accounts, f"{gold_root}/dim_accounts")
+    transaction_metrics = write_delta(fact_transactions, f"{gold_root}/fact_transactions")
 
-    set_gold_count("dim_customers", dim_customers.count())
-    set_gold_count("dim_accounts", dim_accounts.count())
-    set_gold_count("fact_transactions", fact_transactions.count())
+    set_gold_count("dim_customers", metric_int(customer_metrics, "numOutputRows"))
+    set_gold_count("dim_accounts", metric_int(account_metrics, "numOutputRows"))
+    set_gold_count("fact_transactions", metric_int(transaction_metrics, "numOutputRows"))
     _write_report_if_needed(config, stage)

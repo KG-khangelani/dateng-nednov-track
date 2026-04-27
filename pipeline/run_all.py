@@ -1,4 +1,4 @@
-from pipeline.common import infer_stage, load_config, spark_session
+from pipeline.common import cleanup_spark_local_dir, infer_stage, load_config, spark_session
 from pipeline.ingest import run_ingestion
 from pipeline.provision import run_provisioning
 from pipeline.stream_ingest import run_stream_ingestion
@@ -16,8 +16,8 @@ def main():
             run_stream_ingestion()
     finally:
         spark.stop()
+        cleanup_spark_local_dir(config)
 
 
 if __name__ == "__main__":
     main()
-

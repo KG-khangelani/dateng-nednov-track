@@ -1,6 +1,7 @@
 import time
 from pathlib import Path
 
+from pyspark import StorageLevel
 from pyspark.sql import Window
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
@@ -71,8 +72,9 @@ def _normalise_stream_events(spark, file_path, dim_accounts):
 
 
 def _update_current_balances(spark, events, current_path, dim_accounts):
-    existing = _read_or_empty(spark, current_path, CURRENT_BALANCES_SCHEMA)
-    if existing.count() == 0:
+    if _table_exists(current_path):
+        existing = read_delta(spark, current_path)
+    else:
         existing = dim_accounts.select(
             "account_id",
             "current_balance",
@@ -135,8 +137,8 @@ def run_stream_ingestion():
     stream_config = config.get("streaming", {})
     stream_dir = Path(stream_config.get("stream_input_path", "/data/stream"))
     stream_gold_root = stream_config.get("stream_gold_path", "/data/output/stream_gold")
-    poll_interval = int(stream_config.get("poll_interval_seconds", 10))
-    quiesce_timeout = int(stream_config.get("quiesce_timeout_seconds", 60))
+    poll_interval = int(stream_config.get("poll_interval_seconds", 1))
+    quiesce_timeout = int(stream_config.get("quiesce_timeout_seconds", 5))
 
     if not stream_dir.exists():
         return
@@ -155,10 +157,9 @@ def run_stream_ingestion():
 
         for file_path in new_files:
             events = _normalise_stream_events(spark, file_path, dim_accounts)
-            events = events.cache()
-            if events.count() > 0:
-                _update_current_balances(spark, events, current_path, dim_accounts)
-                _update_recent_transactions(spark, events, recent_path)
+            events = events.persist(StorageLevel.MEMORY_AND_DISK)
+            _update_current_balances(spark, events, current_path, dim_accounts)
+            _update_recent_transactions(spark, events, recent_path)
             events.unpersist()
             processed.add(file_path.name)
             last_new_file = time.time()

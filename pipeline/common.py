@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,8 +78,13 @@ def load_config():
 
 
 def load_dq_rules():
+    config_path = None
+    try:
+        config_path = (load_config().get("dq") or {}).get("rules_path")
+    except FileNotFoundError:
+        config_path = None
     path = _existing_path(
-        os.environ.get("DQ_RULES_CONFIG", DEFAULT_DQ_RULES),
+        os.environ.get("DQ_RULES_CONFIG", config_path or DEFAULT_DQ_RULES),
         PROJECT_ROOT / "config" / "dq_rules.yaml",
     )
     if not Path(path).exists():
@@ -100,6 +106,26 @@ def infer_stage(config=None):
     return "1"
 
 
+def _spark_local_dir(config):
+    spark_config = (config or {}).get("spark", {})
+    configured = spark_config.get("local_dir") or os.environ.get("SPARK_LOCAL_DIR")
+    if configured:
+        return configured, False
+    if Path("/data/output").exists():
+        return "/data/output/_spark_tmp", True
+    return "/tmp", False
+
+
+def cleanup_spark_local_dir(config=None):
+    path, managed = _spark_local_dir(config or {})
+    if not managed:
+        return
+    output_root = Path((config or {}).get("output", {}).get("gold_path", "/data/output/gold")).parent.resolve()
+    target = Path(path).resolve()
+    if target.name == "_spark_tmp" and (target == output_root / "_spark_tmp" or output_root in target.parents):
+        shutil.rmtree(target, ignore_errors=True)
+
+
 def spark_session(config=None):
     config = config or load_config()
     os.environ.setdefault("SPARK_LOCAL_HOSTNAME", "localhost")
@@ -108,6 +134,7 @@ def spark_session(config=None):
     if not Path(os.environ.get("SPARK_HOME", "")).exists():
         os.environ["SPARK_HOME"] = pyspark_home
     spark_config = config.get("spark", {})
+    spark_local_dir, _ = _spark_local_dir(config)
     builder = (
         SparkSession.builder.appName(spark_config.get("app_name", "nedbank-de-pipeline"))
         .master(spark_config.get("master", "local[2]"))
@@ -115,9 +142,20 @@ def spark_session(config=None):
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
         .config("spark.driver.host", "127.0.0.1")
         .config("spark.driver.bindAddress", "127.0.0.1")
-        .config("spark.sql.shuffle.partitions", os.environ.get("SPARK_SHUFFLE_PARTITIONS", "16"))
-        .config("spark.default.parallelism", os.environ.get("SPARK_DEFAULT_PARALLELISM", "16"))
+        .config("spark.local.dir", spark_local_dir)
+        .config("spark.driver.memory", os.environ.get("SPARK_DRIVER_MEMORY", "1g"))
+        .config("spark.executor.memory", os.environ.get("SPARK_EXECUTOR_MEMORY", "1g"))
+        .config("spark.sql.shuffle.partitions", os.environ.get("SPARK_SHUFFLE_PARTITIONS", "4"))
+        .config("spark.default.parallelism", os.environ.get("SPARK_DEFAULT_PARALLELISM", "4"))
+        .config("spark.sql.files.maxPartitionBytes", os.environ.get("SPARK_MAX_PARTITION_BYTES", "67108864"))
+        .config("spark.sql.autoBroadcastJoinThreshold", os.environ.get("SPARK_AUTO_BROADCAST_THRESHOLD", "67108864"))
+        .config("spark.sql.parquet.compression.codec", os.environ.get("SPARK_PARQUET_COMPRESSION", "uncompressed"))
+        .config("spark.sql.adaptive.enabled", os.environ.get("SPARK_SQL_ADAPTIVE", "true"))
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
     )
+    delta_jars = sorted(Path(os.environ.get("DELTA_JARS_DIR", "/opt/delta-jars")).glob("*.jar"))
+    if delta_jars:
+        return builder.config("spark.jars", ",".join(str(path) for path in delta_jars)).getOrCreate()
     return configure_spark_with_delta_pip(builder).getOrCreate()
 
 
@@ -126,13 +164,39 @@ def output_path(config, layer, table=None):
     return f"{root}/{table}" if table else root
 
 
+def _latest_delta_operation_metrics(path):
+    log_dir = Path(path) / "_delta_log"
+    if not log_dir.exists():
+        return {}
+    for log_file in sorted(log_dir.glob("*.json"), reverse=True):
+        with open(log_file, "r", encoding="utf-8") as handle:
+            for line in handle:
+                action = json.loads(line)
+                metrics = action.get("commitInfo", {}).get("operationMetrics")
+                if metrics:
+                    return metrics
+    return {}
+
+
+def metric_int(metrics, name, default=0):
+    value = (metrics or {}).get(name, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def write_delta(df, path, mode="overwrite"):
+    output_partitions = int(os.environ.get("DELTA_OUTPUT_PARTITIONS", "4"))
+    if output_partitions > 0:
+        df = df.coalesce(output_partitions)
     (
         df.write.format("delta")
         .mode(mode)
         .option("overwriteSchema", "true")
         .save(path)
     )
+    return _latest_delta_operation_metrics(path)
 
 
 def read_delta(spark, path):

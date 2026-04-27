@@ -10,6 +10,7 @@ ENV SPARK_LOCAL_IP=127.0.0.1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN python -c "from delta import configure_spark_with_delta_pip; from pyspark.sql import SparkSession; spark = configure_spark_with_delta_pip(SparkSession.builder.master('local[1]').appName('cache-delta-jars').config('spark.sql.extensions','io.delta.sql.DeltaSparkSessionExtension').config('spark.sql.catalog.spark_catalog','org.apache.spark.sql.delta.catalog.DeltaCatalog')).getOrCreate(); spark.stop()"
+RUN mkdir -p /opt/delta-jars && cp /root/.ivy2/jars/*.jar /opt/delta-jars/
 
 # Copy pipeline code and configuration into the image.
 # Do NOT copy data files or output directories — these are injected at runtime

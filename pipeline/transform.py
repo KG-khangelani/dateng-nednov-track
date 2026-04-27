@@ -29,8 +29,8 @@ DEFAULT_ACTIONS = {
 }
 
 
-def _action(issue_type):
-    rule = (load_dq_rules().get("rules") or {}).get(issue_type, {})
+def _action(issue_type, rules):
+    rule = (rules.get("rules") or {}).get(issue_type, {})
     return rule.get("handling_action", DEFAULT_ACTIONS[issue_type])
 
 
@@ -39,12 +39,18 @@ def _dedupe(df, key, order_cols):
     return df.withColumn("_rn", F.row_number().over(window)).where(F.col("_rn") == 1).drop("_rn")
 
 
-def _issue_count(df, predicate):
-    return df.where(predicate).count()
+def _count_if(predicate):
+    return F.sum(F.when(predicate, F.lit(1)).otherwise(F.lit(0))).cast("long")
+
+
+def _aggregate_metrics(df, **expressions):
+    row = df.agg(*[expr.alias(name) for name, expr in expressions.items()]).first()
+    return {name: int(row[name] or 0) for name in expressions}
 
 
 def run_transformation():
     config = load_config()
+    rules = load_dq_rules()
     spark = spark_session(config)
     bronze_root = output_path(config, "bronze")
     silver_root = output_path(config, "silver")
@@ -58,7 +64,12 @@ def run_transformation():
         .withColumn("risk_score", F.col("risk_score").cast("int"))
         .withColumn("dob_date_variant", date_variant_flag(F.col("dob")))
     )
-    date_customer_count = _issue_count(customers, F.col("dob_date_variant"))
+    customer_metrics = _aggregate_metrics(
+        customers,
+        source_count=_count_if(F.lit(True)),
+        date_customer_count=_count_if(F.col("dob_date_variant")),
+    )
+    date_customer_count = customer_metrics["date_customer_count"]
     customers = _dedupe(customers, "customer_id", ["customer_id"]).select(
         "customer_id",
         "id_number",
@@ -86,12 +97,19 @@ def run_transformation():
             | (F.col("last_activity_date").isNotNull() & date_variant_flag(F.col("last_activity_date"))),
         )
     )
-    null_account_count = _issue_count(accounts, F.col("account_id").isNull() | (F.trim(F.col("account_id")) == ""))
-    date_account_count = _issue_count(accounts, F.col("date_variant"))
-    account_quarantine = accounts.where(F.col("account_id").isNull() | (F.trim(F.col("account_id")) == ""))
-    accounts_valid = accounts.where(F.col("account_id").isNotNull() & (F.trim(F.col("account_id")) != ""))
+    account_id_missing = F.col("account_id").isNull() | (F.trim(F.col("account_id")) == "")
+    account_metrics = _aggregate_metrics(
+        accounts,
+        source_count=_count_if(F.lit(True)),
+        null_account_count=_count_if(account_id_missing),
+        date_account_count=_count_if(F.col("date_variant")),
+    )
+    null_account_count = account_metrics["null_account_count"]
+    date_account_count = account_metrics["date_account_count"]
+    account_quarantine = accounts.where(account_id_missing)
+    accounts_valid = accounts.where(~account_id_missing)
     accounts_valid = _dedupe(accounts_valid, "account_id", ["account_id"])
-    accounts_valid = accounts_valid.join(customers.select("customer_id"), accounts_valid.customer_ref == customers.customer_id, "inner")
+    accounts_valid = accounts_valid.join(F.broadcast(customers.select("customer_id")), accounts_valid.customer_ref == customers.customer_id, "inner")
     accounts_valid = accounts_valid.select(
         "account_id",
         "customer_ref",
@@ -120,17 +138,22 @@ def run_transformation():
         .withColumn("currency_variant", currency_variant_flag(F.col("currency")))
     )
 
-    source_transactions = METRICS["source_record_counts"].get("transactions_raw", transactions.count())
-    source_accounts = METRICS["source_record_counts"].get("accounts_raw", accounts_b.count())
-    source_all = source_transactions + source_accounts + METRICS["source_record_counts"].get("customers_raw", customers_b.count())
-
     duplicate_window = Window.partitionBy("transaction_id").orderBy(F.col("transaction_timestamp").asc_nulls_last(), F.col("raw_json"))
     transactions_ranked = transactions.withColumn("_rn", F.row_number().over(duplicate_window))
-    duplicate_count = transactions_ranked.where(F.col("_rn") > 1).count()
+    transaction_metrics = _aggregate_metrics(
+        transactions_ranked,
+        source_count=_count_if(F.lit(True)),
+        duplicate_count=_count_if(F.col("_rn") > 1),
+        type_count=_count_if(F.col("amount_type_mismatch") | F.col("amount_cast_failed")),
+        date_transaction_count=_count_if(F.col("transaction_date_variant")),
+        currency_count=_count_if(F.col("currency_variant")),
+    )
+    source_transactions = METRICS["source_record_counts"].get("transactions_raw", transaction_metrics["source_count"])
+    source_accounts = METRICS["source_record_counts"].get("accounts_raw", account_metrics["source_count"])
+    source_customers = METRICS["source_record_counts"].get("customers_raw", customer_metrics["source_count"])
+    source_all = source_transactions + source_accounts + source_customers
+    duplicate_count = transaction_metrics["duplicate_count"]
     transactions_deduped = transactions_ranked.where(F.col("_rn") == 1).drop("_rn")
-
-    orphaned = transactions_deduped.join(accounts_valid.select("account_id"), "account_id", "left_anti")
-    orphan_count = orphaned.count()
 
     required_missing = (
         F.col("transaction_id").isNull()
@@ -142,13 +165,31 @@ def run_transformation():
         | F.col("currency_clean").isNull()
         | F.col("channel").isNull()
     )
-    bad_required = transactions_deduped.where(required_missing)
-    cleanable_transactions = transactions_deduped.where(~required_missing)
-    transactions_valid = cleanable_transactions.join(accounts_valid.select("account_id"), "account_id", "inner")
+    account_ids = F.broadcast(accounts_valid.select("account_id").withColumn("_account_exists", F.lit(True)))
+    transactions_joined = transactions_deduped.join(account_ids, "account_id", "left")
+    orphaned_condition = F.col("_account_exists").isNull()
+    valid_transaction_condition = ~required_missing & ~orphaned_condition
+    deduped_metrics = _aggregate_metrics(
+        transactions_joined,
+        orphan_count=_count_if(orphaned_condition),
+        bad_required_count=_count_if(required_missing),
+        type_output_count=_count_if(valid_transaction_condition & F.col("amount_type_mismatch")),
+        currency_output_count=_count_if(
+            valid_transaction_condition
+            & ~F.col("amount_type_mismatch")
+            & ~F.col("transaction_date_variant")
+            & F.col("currency_variant")
+        ),
+    )
+    orphan_count = deduped_metrics["orphan_count"]
+    bad_required_count = deduped_metrics["bad_required_count"]
+    bad_required = transactions_joined.where(required_missing).drop("_account_exists")
+    orphaned = transactions_joined.where(orphaned_condition).drop("_account_exists")
+    transactions_valid = transactions_joined.where(valid_transaction_condition).drop("_account_exists")
 
-    type_count = _issue_count(transactions, F.col("amount_type_mismatch") | F.col("amount_cast_failed"))
-    date_transaction_count = _issue_count(transactions, F.col("transaction_date_variant"))
-    currency_count = _issue_count(transactions, F.col("currency_variant"))
+    type_count = transaction_metrics["type_count"]
+    date_transaction_count = transaction_metrics["date_transaction_count"]
+    currency_count = transaction_metrics["currency_count"]
 
     transactions_silver = (
         transactions_valid.withColumn(
@@ -175,18 +216,18 @@ def run_transformation():
         )
     )
 
-    add_issue("DUPLICATE_DEDUPED", duplicate_count, source_transactions, _action("DUPLICATE_DEDUPED"), transactions_deduped.count())
-    add_issue("ORPHANED_ACCOUNT", orphan_count, source_transactions, _action("ORPHANED_ACCOUNT"), 0)
-    add_issue("TYPE_MISMATCH", type_count, source_transactions, _action("TYPE_MISMATCH"), transactions_silver.where(F.col("dq_flag") == "TYPE_MISMATCH").count())
-    add_issue("DATE_FORMAT", date_transaction_count + date_account_count + date_customer_count, source_all, _action("DATE_FORMAT"), date_transaction_count + date_account_count + date_customer_count)
-    add_issue("CURRENCY_VARIANT", currency_count, source_transactions, _action("CURRENCY_VARIANT"), transactions_silver.where(F.col("dq_flag") == "CURRENCY_VARIANT").count())
-    add_issue("NULL_REQUIRED", null_account_count, source_accounts, _action("NULL_REQUIRED"), 0)
+    add_issue("DUPLICATE_DEDUPED", duplicate_count, source_transactions, _action("DUPLICATE_DEDUPED", rules), source_transactions - duplicate_count)
+    add_issue("ORPHANED_ACCOUNT", orphan_count, source_transactions, _action("ORPHANED_ACCOUNT", rules), 0)
+    add_issue("TYPE_MISMATCH", type_count, source_transactions, _action("TYPE_MISMATCH", rules), deduped_metrics["type_output_count"])
+    add_issue("DATE_FORMAT", date_transaction_count + date_account_count + date_customer_count, source_all, _action("DATE_FORMAT", rules), date_transaction_count + date_account_count + date_customer_count)
+    add_issue("CURRENCY_VARIANT", currency_count, source_transactions, _action("CURRENCY_VARIANT", rules), deduped_metrics["currency_output_count"])
+    add_issue("NULL_REQUIRED", null_account_count, source_accounts, _action("NULL_REQUIRED", rules), 0)
 
     write_delta(customers, f"{silver_root}/customers")
     write_delta(accounts_valid, f"{silver_root}/accounts")
     write_delta(transactions_silver, f"{silver_root}/transactions")
 
-    if duplicate_count or orphan_count or null_account_count or bad_required.count():
+    if duplicate_count or orphan_count or null_account_count or bad_required_count:
         write_delta(
             transactions_ranked.where(F.col("_rn") > 1).select("raw_json").unionByName(orphaned.select("raw_json"), allowMissingColumns=True).unionByName(bad_required.select("raw_json"), allowMissingColumns=True),
             f"{silver_root}/quarantine_transactions",

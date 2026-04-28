@@ -52,4 +52,5 @@ def advisory_rule_catalog():
         "NUMERIC_OUTLIER": "Numeric field is outside an expected operating range.",
         "PROFILE_INCOMPLETE": "Customer or account profile is missing expected attributes.",
         "LOCATION_MISMATCH": "Transaction geography differs from linked customer geography.",
+        "DOMAIN_DRIFT": "Known domain column contains new values or high-cardinality unknown value growth.",
     }

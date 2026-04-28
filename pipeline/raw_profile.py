@@ -37,6 +37,7 @@ from pipeline.credibility import (
     normalized,
     trimmed,
 )
+from pipeline.domain_drift import full_domain_drift
 from pipeline.metrics import METRICS
 
 
@@ -68,6 +69,7 @@ def load_credibility_rules(config=None):
 
 def _settings(rules):
     profile = rules.get("profile") or {}
+    domain_drift = profile.get("domain_drift") or {}
     mode = str(os.environ.get("CREDIBILITY_PROFILE_MODE", profile.get("mode", "light"))).strip().lower()
     if mode not in {"light", "full", "off"}:
         mode = "light"
@@ -84,6 +86,10 @@ def _settings(rules):
         "percentile_accuracy": int(profile.get("percentile_accuracy", 100)),
         "extreme_amount_threshold": float(profile.get("extreme_amount_threshold", 50000)),
         "extreme_balance_threshold": float(profile.get("extreme_balance_threshold", 250000)),
+        "domain_drift_enabled": bool(domain_drift.get("enabled", True)),
+        "domain_drift_unknown_threshold": int(domain_drift.get("high_cardinality_unknown_threshold", 50)),
+        "domain_drift_unknown_ratio": float(domain_drift.get("high_cardinality_unknown_ratio", 0.25)),
+        "domain_drift_top_k": int(domain_drift.get("top_k_unknown_values", profile.get("top_k", 5))),
     }
 
 
@@ -548,6 +554,7 @@ def _light_profile(rules, settings, duration_seconds):
         "source_record_counts": METRICS.get("source_record_counts", {}),
         "tables": raw_profile.get("tables", {}),
         "cross_table": raw_profile.get("cross_table", {}),
+        "domain_drift": raw_profile.get("domain_drift", {}),
         "adaptive_chunking": raw_profile.get("adaptive_chunking", {}),
         "performance_observation": {
             "profiling_duration_seconds": duration_seconds,
@@ -593,6 +600,10 @@ def run_raw_profile():
     cross_table = _cross_table_profile(transactions, accounts, customers, table_profiles, settings)
     section_durations["cross_table"] = int(time.time() - section_started)
 
+    section_started = time.time()
+    domain_drift = full_domain_drift(transactions, accounts, customers, settings)
+    section_durations["domain_drift"] = int(time.time() - section_started)
+
     profile = {
         "$schema": "nedbank-de-challenge/raw-anomaly-profile/v1",
         "run_timestamp": RUN_TIMESTAMP,
@@ -606,6 +617,7 @@ def run_raw_profile():
         "advisory_rule_catalog": advisory_rule_catalog(),
         "tables": table_profiles,
         "cross_table": cross_table,
+        "domain_drift": domain_drift,
         "performance_observation": {
             "profiling_duration_seconds": int(time.time() - started_at),
             "section_duration_seconds": section_durations,

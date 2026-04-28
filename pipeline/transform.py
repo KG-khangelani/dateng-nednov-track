@@ -31,6 +31,13 @@ from pipeline.common import (
     spark_session,
     write_delta,
 )
+from pipeline.domain_drift import (
+    approx_distinct_clean_unknown_values,
+    approx_distinct_clean_values,
+    approx_distinct_unknown_values,
+    approx_distinct_values,
+    light_domain_drift,
+)
 from pipeline.metrics import METRICS, add_issue, set_raw_profile_section
 
 
@@ -204,6 +211,17 @@ def _set_light_raw_profile(
             "transactions_with_unknown_account_id": _metric(deduped_metrics["orphan_count"], source_transactions),
         },
     )
+    set_raw_profile_section(
+        "domain_drift",
+        light_domain_drift(
+            transaction_metrics,
+            account_metrics,
+            customer_metrics,
+            source_transactions,
+            source_accounts,
+            source_customers,
+        ),
+    )
 
 
 def run_transformation():
@@ -231,6 +249,12 @@ def run_transformation():
         invalid_gender_count=_count_if(invalid_domain(F.col("gender"), GENDERS)),
         invalid_customer_province_count=_count_if(invalid_domain(F.col("province"), SA_PROVINCES)),
         invalid_kyc_status_count=_count_if(invalid_domain(F.col("kyc_status"), KYC_STATUSES)),
+        gender_distinct_count=approx_distinct_values(F.col("gender")),
+        gender_unknown_distinct_count=approx_distinct_unknown_values(F.col("gender"), GENDERS),
+        customer_province_distinct_count=approx_distinct_values(F.col("province")),
+        customer_province_unknown_distinct_count=approx_distinct_unknown_values(F.col("province"), SA_PROVINCES),
+        kyc_status_distinct_count=approx_distinct_values(F.col("kyc_status")),
+        kyc_status_unknown_distinct_count=approx_distinct_unknown_values(F.col("kyc_status"), KYC_STATUSES),
         risk_score_outside_range_count=_count_if(
             F.col("risk_score").isNotNull() & ((F.col("risk_score") < 1) | (F.col("risk_score") > 10))
         ),
@@ -282,6 +306,14 @@ def run_transformation():
         invalid_account_status_count=_count_if(invalid_domain(F.col("account_status"), ACCOUNT_STATUSES)),
         invalid_product_tier_count=_count_if(invalid_domain(F.col("product_tier"), PRODUCT_TIERS)),
         invalid_digital_channel_count=_count_if(invalid_domain(F.col("digital_channel"), DIGITAL_CHANNELS)),
+        account_type_distinct_count=approx_distinct_values(F.col("account_type")),
+        account_type_unknown_distinct_count=approx_distinct_unknown_values(F.col("account_type"), ACCOUNT_TYPES),
+        account_status_distinct_count=approx_distinct_values(F.col("account_status")),
+        account_status_unknown_distinct_count=approx_distinct_unknown_values(F.col("account_status"), ACCOUNT_STATUSES),
+        product_tier_distinct_count=approx_distinct_values(F.col("product_tier")),
+        product_tier_unknown_distinct_count=approx_distinct_unknown_values(F.col("product_tier"), PRODUCT_TIERS),
+        digital_channel_distinct_count=approx_distinct_values(F.col("digital_channel")),
+        digital_channel_unknown_distinct_count=approx_distinct_unknown_values(F.col("digital_channel"), DIGITAL_CHANNELS),
         negative_current_balance_count=_count_if(F.col("current_balance") < 0),
         negative_credit_limit_count=_count_if(F.col("credit_limit") < 0),
         current_balance_quantiles=F.expr("percentile_approx(current_balance_double, array(0.5, 0.95, 0.99), 100)"),
@@ -343,6 +375,14 @@ def run_transformation():
         invalid_transaction_type_count=_count_if(invalid_domain(F.col("transaction_type"), TRANSACTION_TYPES)),
         invalid_channel_count=_count_if(invalid_domain(F.col("channel"), TRANSACTION_CHANNELS)),
         invalid_transaction_province_count=_count_if(invalid_domain(F.col("province"), SA_PROVINCES)),
+        transaction_type_distinct_count=approx_distinct_values(F.col("transaction_type")),
+        transaction_type_unknown_distinct_count=approx_distinct_unknown_values(F.col("transaction_type"), TRANSACTION_TYPES),
+        channel_distinct_count=approx_distinct_values(F.col("channel")),
+        channel_unknown_distinct_count=approx_distinct_unknown_values(F.col("channel"), TRANSACTION_CHANNELS),
+        currency_distinct_count=approx_distinct_clean_values(F.col("currency_clean")),
+        currency_unknown_distinct_count=approx_distinct_clean_unknown_values(F.col("currency_clean"), {"ZAR"}),
+        transaction_province_distinct_count=approx_distinct_values(F.col("province")),
+        transaction_province_unknown_distinct_count=approx_distinct_unknown_values(F.col("province"), SA_PROVINCES),
     )
     transaction_id_counts = transactions.groupBy("transaction_id").agg(F.count(F.lit(1)).cast("long").alias("_group_count"))
     transaction_group_metrics = _aggregate_metrics(

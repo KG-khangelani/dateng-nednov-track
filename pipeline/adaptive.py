@@ -39,6 +39,7 @@ from pipeline.credibility import (
     invalid_domain,
     is_blank,
 )
+from pipeline.domain_drift import approx_distinct_unknown_values, approx_distinct_values
 from pipeline.ingest import _read_csv_raw, _run_timestamp_col
 from pipeline.metrics import METRICS, add_issue, set_gold_count, set_raw_profile_section, set_source_count
 from pipeline.provision import _age_band, _with_surrogate_key, _write_report_if_needed
@@ -260,6 +261,13 @@ def _finalized_outputs_exist(config, manifest):
     raw_profile_path = Path(gold_root).parent / "audit" / "raw_anomaly_profile.json"
     if not raw_profile_path.exists():
         return False
+    try:
+        with open(raw_profile_path, "r", encoding="utf-8") as handle:
+            raw_profile = json.load(handle)
+        if not raw_profile.get("domain_drift"):
+            return False
+    except (OSError, json.JSONDecodeError):
+        return False
 
     if infer_stage(config) != "1" and not Path(config["output"]["dq_report_path"]).exists():
         return False
@@ -342,6 +350,12 @@ def _transform_dimensions(config):
         invalid_gender_count=_count_if(invalid_domain(F.col("gender"), GENDERS)),
         invalid_customer_province_count=_count_if(invalid_domain(F.col("province"), SA_PROVINCES)),
         invalid_kyc_status_count=_count_if(invalid_domain(F.col("kyc_status"), KYC_STATUSES)),
+        gender_distinct_count=approx_distinct_values(F.col("gender")),
+        gender_unknown_distinct_count=approx_distinct_unknown_values(F.col("gender"), GENDERS),
+        customer_province_distinct_count=approx_distinct_values(F.col("province")),
+        customer_province_unknown_distinct_count=approx_distinct_unknown_values(F.col("province"), SA_PROVINCES),
+        kyc_status_distinct_count=approx_distinct_values(F.col("kyc_status")),
+        kyc_status_unknown_distinct_count=approx_distinct_unknown_values(F.col("kyc_status"), KYC_STATUSES),
         risk_score_outside_range_count=_count_if(
             F.col("risk_score").isNotNull() & ((F.col("risk_score") < 1) | (F.col("risk_score") > 10))
         ),
@@ -392,6 +406,14 @@ def _transform_dimensions(config):
         invalid_account_status_count=_count_if(invalid_domain(F.col("account_status"), ACCOUNT_STATUSES)),
         invalid_product_tier_count=_count_if(invalid_domain(F.col("product_tier"), PRODUCT_TIERS)),
         invalid_digital_channel_count=_count_if(invalid_domain(F.col("digital_channel"), DIGITAL_CHANNELS)),
+        account_type_distinct_count=approx_distinct_values(F.col("account_type")),
+        account_type_unknown_distinct_count=approx_distinct_unknown_values(F.col("account_type"), ACCOUNT_TYPES),
+        account_status_distinct_count=approx_distinct_values(F.col("account_status")),
+        account_status_unknown_distinct_count=approx_distinct_unknown_values(F.col("account_status"), ACCOUNT_STATUSES),
+        product_tier_distinct_count=approx_distinct_values(F.col("product_tier")),
+        product_tier_unknown_distinct_count=approx_distinct_unknown_values(F.col("product_tier"), PRODUCT_TIERS),
+        digital_channel_distinct_count=approx_distinct_values(F.col("digital_channel")),
+        digital_channel_unknown_distinct_count=approx_distinct_unknown_values(F.col("digital_channel"), DIGITAL_CHANNELS),
         negative_current_balance_count=_count_if(F.col("current_balance") < 0),
         negative_credit_limit_count=_count_if(F.col("credit_limit") < 0),
         current_balance_quantiles=F.expr("percentile_approx(current_balance_double, array(0.5, 0.95, 0.99), 100)"),

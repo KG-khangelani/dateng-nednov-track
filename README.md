@@ -58,6 +58,7 @@ Raw anomaly profiling is controlled by `config/credibility_rules.yaml`:
 - `profile.mode: light` is the default scoring mode. It reuses ingest/transform aggregates and avoids an extra raw-table scan.
 - `profile.mode: full` keeps the richer Bronze scan with capped top-K summaries for investigation runs.
 - `profile.mode: off` disables the advisory profile while leaving the scored outputs unchanged.
+- `profile.domain_drift` reports audit-only unknown-value drift for known banking domains. Light mode emits invalid counts and approximate cardinalities; full mode can add capped top unknown values and candidate rule suggestions.
 
 Gold tables expected by validation queries:
 

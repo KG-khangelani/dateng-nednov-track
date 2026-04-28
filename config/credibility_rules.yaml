@@ -11,6 +11,11 @@ profile:
   percentile_accuracy: 100
   extreme_amount_threshold: 50000
   extreme_balance_threshold: 250000
+  domain_drift:
+    enabled: true
+    high_cardinality_unknown_threshold: 50
+    high_cardinality_unknown_ratio: 0.25
+    top_k_unknown_values: 5
 
 advisory_rules:
   INVALID_DOMAIN:
@@ -37,3 +42,7 @@ advisory_rules:
     severity: medium
     mode: audit_only
     description: Transaction province differs from linked customer province.
+  DOMAIN_DRIFT:
+    severity: medium
+    mode: audit_only
+    description: Known domain columns contain new values or high-cardinality unknown value explosions.

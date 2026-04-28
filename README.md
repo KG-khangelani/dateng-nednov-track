@@ -23,7 +23,9 @@ The top-level flow is deterministic and non-interactive:
 `runtime.mode: scorer` is the default and follows that path. `runtime.mode:
 adaptive` is opt-in for larger local runs; it preflights input size and Docker
 limits, then uses resumable transaction hash buckets only when the derived tier
-is `large`.
+is `large`. Adaptive bucket scheduling records estimates in
+`chunk_manifest.json` and processes active/failed buckets first, then remaining
+buckets largest-first by estimated work.
 
 No prompts or stdin reads are allowed in the scoring container (no TTY attached).
 

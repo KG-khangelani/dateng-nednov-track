@@ -70,6 +70,7 @@ runtime:
   adaptive:
     max_bucket_bytes: 268435456
     max_bucket_count: 256
+    schedule_strategy: resume_failed_largest_first
     manifest_path: /data/output/audit/chunk_manifest.json
 
 # Table-aware Delta output sizing. Small dimensions stay compact while

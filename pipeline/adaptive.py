@@ -57,6 +57,7 @@ from pipeline.transform import (
 
 DEFAULT_MAX_BUCKET_BYTES = 256 * 1024 * 1024
 DEFAULT_MAX_BUCKET_COUNT = 256
+DEFAULT_SCHEDULE_STRATEGY = "resume_failed_largest_first"
 SAMPLE_LINES = 10000
 
 
@@ -165,6 +166,7 @@ def build_preflight_plan(config=None):
         "bucket_count_source": bucket_source,
         "max_bucket_bytes": max_bucket_bytes,
         "max_bucket_count": max_bucket_count,
+        "schedule_strategy": adaptive.get("schedule_strategy", DEFAULT_SCHEDULE_STRATEGY),
         "estimated_transaction_rows": _estimate_jsonl_rows(input_config.get("transactions_path", ""), transaction_bytes),
         "input_fingerprints": fingerprints,
         "manifest_path": adaptive.get("manifest_path", "/data/output/audit/chunk_manifest.json"),
@@ -276,6 +278,149 @@ def _finalized_outputs_exist(config, manifest):
 
 def _bucket_dir(root, table, bucket_id):
     return f"{root}/{table}_chunks/bucket={int(bucket_id):05d}"
+
+
+def _int_set(values):
+    result = set()
+    for value in values or []:
+        try:
+            result.add(int(value))
+        except (TypeError, ValueError):
+            pass
+    return result
+
+
+def _bucket_output_complete(config, bucket_id):
+    silver_bucket_path = _bucket_dir(output_path(config, "silver"), "transactions", bucket_id)
+    gold_bucket_path = _bucket_dir(output_path(config, "gold"), "fact_transactions", bucket_id)
+    return _delta_exists(silver_bucket_path) and _delta_exists(gold_bucket_path)
+
+
+def _bucket_partition_bytes(config, bucket_id):
+    transactions_path = Path(output_path(config, "bronze", "transactions"))
+    candidates = [
+        transactions_path / f"_processing_bucket={int(bucket_id)}",
+        transactions_path / f"_processing_bucket={int(bucket_id):05d}",
+    ]
+    partition_path = next((path for path in candidates if path.exists()), None)
+    if partition_path is None:
+        return 0
+
+    total = 0
+    for file_path in partition_path.rglob("*"):
+        if not file_path.is_file() or file_path.name.startswith("."):
+            continue
+        try:
+            total += int(file_path.stat().st_size)
+        except OSError:
+            pass
+    return total
+
+
+def _estimate_bucket_work(config, manifest, bucket_count):
+    previous_metrics = manifest.get("bucket_metrics") or {}
+    source_total = METRICS["source_record_counts"].get("transactions_raw", 0)
+    estimates = {}
+    total_bytes = 0
+    for bucket_id in range(int(bucket_count)):
+        bucket_bytes = _bucket_partition_bytes(config, bucket_id)
+        total_bytes += bucket_bytes
+        prior = previous_metrics.get(str(bucket_id), {})
+        estimates[str(bucket_id)] = {
+            "estimated_bytes": bucket_bytes,
+            "previous_source_count": prior.get("source_count"),
+            "previous_duration_seconds": prior.get("duration_seconds"),
+        }
+
+    for bucket_id in range(int(bucket_count)):
+        estimate = estimates[str(bucket_id)]
+        if estimate["previous_source_count"] is not None:
+            estimated_rows = int(estimate["previous_source_count"])
+            row_source = "previous_bucket_metric"
+        elif total_bytes > 0 and source_total:
+            estimated_rows = int(round(source_total * estimate["estimated_bytes"] / total_bytes))
+            row_source = "bronze_partition_byte_ratio"
+        else:
+            estimated_rows = None
+            row_source = "unavailable"
+
+        if estimate["previous_duration_seconds"] is not None:
+            priority_weight = float(estimate["previous_duration_seconds"])
+            priority_source = "previous_duration_seconds"
+        elif estimated_rows is not None:
+            priority_weight = float(estimated_rows)
+            priority_source = "estimated_rows"
+        else:
+            priority_weight = float(estimate["estimated_bytes"])
+            priority_source = "estimated_bytes"
+
+        estimate["estimated_rows"] = estimated_rows
+        estimate["estimated_rows_source"] = row_source
+        estimate["priority_weight"] = priority_weight
+        estimate["priority_source"] = priority_source
+
+    return estimates
+
+
+def _scheduled_bucket_order(config, manifest, preflight, bucket_estimates):
+    bucket_count = int(preflight["bucket_count"])
+    strategy = str(preflight.get("schedule_strategy") or DEFAULT_SCHEDULE_STRATEGY).strip().lower()
+    completed_with_outputs = {
+        bucket_id
+        for bucket_id in _int_set(manifest.get("completed_buckets"))
+        if 0 <= bucket_id < bucket_count and _bucket_output_complete(config, bucket_id)
+    }
+
+    def by_weight(bucket_id):
+        estimate = bucket_estimates.get(str(bucket_id), {})
+        return (-float(estimate.get("priority_weight") or 0), int(bucket_id))
+
+    if strategy == "sequential":
+        order = [bucket_id for bucket_id in range(bucket_count) if bucket_id not in completed_with_outputs]
+        priority_groups = [{"name": "incomplete_sequential", "buckets": order}]
+    else:
+        active = manifest.get("active_bucket")
+        try:
+            active = int(active) if active is not None else None
+        except (TypeError, ValueError):
+            active = None
+        active_group = []
+        if active is not None and 0 <= active < bucket_count and active not in completed_with_outputs:
+            active_group = [active]
+
+        failed_group = sorted(
+            [
+                bucket_id
+                for bucket_id in _int_set(manifest.get("failed_buckets"))
+                if 0 <= bucket_id < bucket_count and bucket_id not in completed_with_outputs and bucket_id not in active_group
+            ],
+            key=by_weight,
+        )
+        remaining_group = sorted(
+            [
+                bucket_id
+                for bucket_id in range(bucket_count)
+                if bucket_id not in completed_with_outputs
+                and bucket_id not in active_group
+                and bucket_id not in failed_group
+            ],
+            key=by_weight,
+        )
+        order = active_group + failed_group + remaining_group
+        priority_groups = [
+            {"name": "resume_active_bucket", "buckets": active_group},
+            {"name": "retry_failed_largest_first", "buckets": failed_group},
+            {"name": "incomplete_largest_first", "buckets": remaining_group},
+        ]
+
+    return {
+        "strategy": strategy,
+        "bucket_order": order,
+        "skipped_completed_buckets": sorted(completed_with_outputs),
+        "priority_groups": priority_groups,
+        "bucket_estimate_count": len(bucket_estimates),
+        "created_at": RUN_TIMESTAMP,
+    }
 
 
 def _union_delta_paths(spark, paths):
@@ -779,10 +924,16 @@ def run_adaptive_pipeline(preflight):
         return result
 
     run_adaptive_ingestion(preflight)
+    bucket_estimates = _estimate_bucket_work(config, manifest, bucket_count)
+    schedule_plan = _scheduled_bucket_order(config, manifest, preflight, bucket_estimates)
+    manifest["bucket_estimates"] = bucket_estimates
+    manifest["schedule_plan"] = schedule_plan
+    _write_manifest(preflight, manifest)
+
     dimensions = _transform_dimensions(config)
     try:
         completed = set(int(bucket) for bucket in manifest.get("completed_buckets", []))
-        for bucket_id in range(bucket_count):
+        for bucket_id in schedule_plan["bucket_order"]:
             silver_bucket_path = _bucket_dir(output_path(config, "silver"), "transactions", bucket_id)
             gold_bucket_path = _bucket_dir(output_path(config, "gold"), "fact_transactions", bucket_id)
             if bucket_id in completed and _delta_exists(silver_bucket_path) and _delta_exists(gold_bucket_path):

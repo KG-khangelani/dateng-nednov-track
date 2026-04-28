@@ -12,6 +12,7 @@ from pipeline.credibility import (
     SA_PROVINCES,
     TRANSACTION_CHANNELS,
     TRANSACTION_TYPES,
+    domain_values,
     invalid_domain,
     is_blank,
     normalized,
@@ -67,9 +68,10 @@ def _high_cardinality(unknown_distinct, distinct_values, threshold, ratio):
     return False
 
 
-def _field_summary(total, allowed_values, invalid_count, distinct_values=None, unknown_distinct=None, top_unknown_values=None, settings=None):
+def _field_summary(total, allowed_values, invalid_count, distinct_values=None, unknown_distinct=None, top_unknown_values=None, settings=None, field=None):
     settings = settings or {}
-    threshold = int(settings.get("domain_drift_unknown_threshold", DEFAULT_UNKNOWN_THRESHOLD))
+    policy = ((settings.get("domains") or {}).get(field or "") or {})
+    threshold = int(policy.get("high_cardinality_threshold", settings.get("domain_drift_unknown_threshold", DEFAULT_UNKNOWN_THRESHOLD)))
     ratio = float(settings.get("domain_drift_unknown_ratio", DEFAULT_UNKNOWN_RATIO))
     high_cardinality = _high_cardinality(unknown_distinct, distinct_values, threshold, ratio)
     suggestions = []
@@ -85,6 +87,7 @@ def _field_summary(total, allowed_values, invalid_count, distinct_values=None, u
 
     return {
         "known_allowed_value_count": len(allowed_values),
+        "unknown_policy": policy.get("unknown_policy", "audit_only"),
         "invalid_values": _metric(invalid_count, total),
         "approx_distinct_values": _nullable_int(distinct_values),
         "approx_distinct_unknown_values": _nullable_int(unknown_distinct),
@@ -94,7 +97,7 @@ def _field_summary(total, allowed_values, invalid_count, distinct_values=None, u
     }
 
 
-def _light_field(metrics, total, allowed_values, invalid_key, distinct_key, unknown_key, settings):
+def _light_field(field, metrics, total, allowed_values, invalid_key, distinct_key, unknown_key, settings):
     return _field_summary(
         total=total,
         allowed_values=allowed_values,
@@ -102,7 +105,12 @@ def _light_field(metrics, total, allowed_values, invalid_key, distinct_key, unkn
         distinct_values=metrics.get(distinct_key),
         unknown_distinct=metrics.get(unknown_key),
         settings=settings,
+        field=field,
     )
+
+
+def _allowed(field, fallback, settings=None):
+    return domain_values(field, settings or {}, fallback)
 
 
 def light_domain_drift(transaction_metrics, account_metrics, customer_metrics, source_transactions, source_accounts, source_customers, settings=None):
@@ -120,99 +128,110 @@ def light_domain_drift(transaction_metrics, account_metrics, customer_metrics, s
         },
         "fields": {
             "transactions.transaction_type": _light_field(
+                "transactions.transaction_type",
                 transaction_metrics,
                 source_transactions,
-                TRANSACTION_TYPES,
+                _allowed("transactions.transaction_type", TRANSACTION_TYPES, settings),
                 "invalid_transaction_type_count",
                 "transaction_type_distinct_count",
                 "transaction_type_unknown_distinct_count",
                 settings,
             ),
             "transactions.channel": _light_field(
+                "transactions.channel",
                 transaction_metrics,
                 source_transactions,
-                TRANSACTION_CHANNELS,
+                _allowed("transactions.channel", TRANSACTION_CHANNELS, settings),
                 "invalid_channel_count",
                 "channel_distinct_count",
                 "channel_unknown_distinct_count",
                 settings,
             ),
             "transactions.currency": _light_field(
+                "transactions.currency",
                 transaction_metrics,
                 source_transactions,
-                {"ZAR"},
+                _allowed("transactions.currency", {"ZAR"}, settings),
                 "invalid_currency_count",
                 "currency_distinct_count",
                 "currency_unknown_distinct_count",
                 settings,
             ),
             "transactions.province": _light_field(
+                "transactions.province",
                 transaction_metrics,
                 source_transactions,
-                SA_PROVINCES,
+                _allowed("transactions.province", SA_PROVINCES, settings),
                 "invalid_transaction_province_count",
                 "transaction_province_distinct_count",
                 "transaction_province_unknown_distinct_count",
                 settings,
             ),
             "accounts.account_type": _light_field(
+                "accounts.account_type",
                 account_metrics,
                 source_accounts,
-                ACCOUNT_TYPES,
+                _allowed("accounts.account_type", ACCOUNT_TYPES, settings),
                 "invalid_account_type_count",
                 "account_type_distinct_count",
                 "account_type_unknown_distinct_count",
                 settings,
             ),
             "accounts.account_status": _light_field(
+                "accounts.account_status",
                 account_metrics,
                 source_accounts,
-                ACCOUNT_STATUSES,
+                _allowed("accounts.account_status", ACCOUNT_STATUSES, settings),
                 "invalid_account_status_count",
                 "account_status_distinct_count",
                 "account_status_unknown_distinct_count",
                 settings,
             ),
             "accounts.product_tier": _light_field(
+                "accounts.product_tier",
                 account_metrics,
                 source_accounts,
-                PRODUCT_TIERS,
+                _allowed("accounts.product_tier", PRODUCT_TIERS, settings),
                 "invalid_product_tier_count",
                 "product_tier_distinct_count",
                 "product_tier_unknown_distinct_count",
                 settings,
             ),
             "accounts.digital_channel": _light_field(
+                "accounts.digital_channel",
                 account_metrics,
                 source_accounts,
-                DIGITAL_CHANNELS,
+                _allowed("accounts.digital_channel", DIGITAL_CHANNELS, settings),
                 "invalid_digital_channel_count",
                 "digital_channel_distinct_count",
                 "digital_channel_unknown_distinct_count",
                 settings,
             ),
             "customers.gender": _light_field(
+                "customers.gender",
                 customer_metrics,
                 source_customers,
-                GENDERS,
+                _allowed("customers.gender", GENDERS, settings),
                 "invalid_gender_count",
                 "gender_distinct_count",
                 "gender_unknown_distinct_count",
                 settings,
             ),
             "customers.province": _light_field(
+                "customers.province",
                 customer_metrics,
                 source_customers,
-                SA_PROVINCES,
+                _allowed("customers.province", SA_PROVINCES, settings),
                 "invalid_customer_province_count",
                 "customer_province_distinct_count",
                 "customer_province_unknown_distinct_count",
                 settings,
             ),
             "customers.kyc_status": _light_field(
+                "customers.kyc_status",
                 customer_metrics,
                 source_customers,
-                KYC_STATUSES,
+                _allowed("customers.kyc_status", KYC_STATUSES, settings),
                 "invalid_kyc_status_count",
                 "kyc_status_distinct_count",
                 "kyc_status_unknown_distinct_count",
@@ -222,41 +241,42 @@ def light_domain_drift(transaction_metrics, account_metrics, customer_metrics, s
     }
 
 
-def _domain_specs():
+def _domain_specs(settings=None):
+    settings = settings or {}
     return {
         "transactions": [
             {
                 "field": "transactions.transaction_type",
                 "column": F.col("transaction_type"),
-                "allowed": TRANSACTION_TYPES,
+                "allowed": _allowed("transactions.transaction_type", TRANSACTION_TYPES, settings),
             },
             {
                 "field": "transactions.channel",
                 "column": F.col("channel"),
-                "allowed": TRANSACTION_CHANNELS,
+                "allowed": _allowed("transactions.channel", TRANSACTION_CHANNELS, settings),
             },
             {
                 "field": "transactions.currency",
                 "column": F.col("currency"),
                 "clean_column": normalise_currency(F.col("currency")),
-                "allowed": {"ZAR"},
+                "allowed": _allowed("transactions.currency", {"ZAR"}, settings),
             },
             {
                 "field": "transactions.province",
                 "column": F.col("location.province"),
-                "allowed": SA_PROVINCES,
+                "allowed": _allowed("transactions.province", SA_PROVINCES, settings),
             },
         ],
         "accounts": [
-            {"field": "accounts.account_type", "column": F.col("account_type"), "allowed": ACCOUNT_TYPES},
-            {"field": "accounts.account_status", "column": F.col("account_status"), "allowed": ACCOUNT_STATUSES},
-            {"field": "accounts.product_tier", "column": F.col("product_tier"), "allowed": PRODUCT_TIERS},
-            {"field": "accounts.digital_channel", "column": F.col("digital_channel"), "allowed": DIGITAL_CHANNELS},
+            {"field": "accounts.account_type", "column": F.col("account_type"), "allowed": _allowed("accounts.account_type", ACCOUNT_TYPES, settings)},
+            {"field": "accounts.account_status", "column": F.col("account_status"), "allowed": _allowed("accounts.account_status", ACCOUNT_STATUSES, settings)},
+            {"field": "accounts.product_tier", "column": F.col("product_tier"), "allowed": _allowed("accounts.product_tier", PRODUCT_TIERS, settings)},
+            {"field": "accounts.digital_channel", "column": F.col("digital_channel"), "allowed": _allowed("accounts.digital_channel", DIGITAL_CHANNELS, settings)},
         ],
         "customers": [
-            {"field": "customers.gender", "column": F.col("gender"), "allowed": GENDERS},
-            {"field": "customers.province", "column": F.col("province"), "allowed": SA_PROVINCES},
-            {"field": "customers.kyc_status", "column": F.col("kyc_status"), "allowed": KYC_STATUSES},
+            {"field": "customers.gender", "column": F.col("gender"), "allowed": _allowed("customers.gender", GENDERS, settings)},
+            {"field": "customers.province", "column": F.col("province"), "allowed": _allowed("customers.province", SA_PROVINCES, settings)},
+            {"field": "customers.kyc_status", "column": F.col("kyc_status"), "allowed": _allowed("customers.kyc_status", KYC_STATUSES, settings)},
         ],
     }
 
@@ -342,7 +362,7 @@ def full_domain_drift(transactions, accounts, customers, settings=None):
         "customers": customers,
     }
     fields = {}
-    for table_name, specs in _domain_specs().items():
+    for table_name, specs in _domain_specs(settings).items():
         row = _table_domain_metrics(frames[table_name], specs)
         top_unknown = _top_unknown_values(frames[table_name], specs, settings)
         total = int(row["_rows"] or 0)
@@ -355,6 +375,7 @@ def full_domain_drift(transactions, accounts, customers, settings=None):
                 unknown_distinct=row[f"unknown_distinct_{index}"],
                 top_unknown_values=top_unknown.get(spec["field"], []),
                 settings=settings,
+                field=spec["field"],
             )
 
     return {

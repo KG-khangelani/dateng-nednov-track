@@ -61,6 +61,7 @@ Raw anomaly profiling is controlled by `config/credibility_rules.yaml`:
 - `profile.mode: full` keeps the richer Bronze scan with capped top-K summaries for investigation runs.
 - `profile.mode: off` disables the advisory profile while leaving the scored outputs unchanged.
 - `profile.domain_drift` reports audit-only unknown-value drift for known banking domains. Light mode emits invalid counts and approximate cardinalities; full mode can add capped top unknown values and candidate rule suggestions.
+- `domains`, `currency`, and `geo` in `credibility_rules.yaml` are governance inputs for future sources. Unknown domain values, non-ZAR currency evidence, and coordinate anomalies are audited as advisory signals; Gold schemas and the six scored `dq_flag` values remain unchanged. Row-level Silver provenance can be enabled with `profile.enable_silver_provenance` for investigation runs.
 
 Gold tables expected by validation queries:
 

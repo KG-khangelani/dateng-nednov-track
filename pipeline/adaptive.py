@@ -36,12 +36,31 @@ from pipeline.credibility import (
     SA_PROVINCES,
     TRANSACTION_CHANNELS,
     TRANSACTION_TYPES,
+    domain_drift_settings,
+    domain_values,
     invalid_domain,
     is_blank,
+    load_credibility_rules,
 )
 from pipeline.domain_drift import approx_distinct_unknown_values, approx_distinct_values
 from pipeline.ingest import _read_csv_raw, _run_timestamp_col
 from pipeline.metrics import METRICS, add_issue, set_gold_count, set_raw_profile_section, set_source_count
+from pipeline.readiness import (
+    coordinate_latitude,
+    coordinate_longitude,
+    currency_conversion_ready,
+    currency_conversion_required,
+    currency_iso_candidate,
+    currency_numeric_candidate,
+    currency_unknown,
+    geo_invalid_world_bounds,
+    geo_outside_sa_bounds,
+    geo_parse_failed,
+    geo_possible_swap,
+    geo_province_mismatch,
+    geo_sa_sign_mismatch,
+    geo_zero_zero,
+)
 from pipeline.provision import _age_band, _with_surrogate_key, _write_report_if_needed
 from pipeline.transform import (
     _action,
@@ -51,6 +70,7 @@ from pipeline.transform import (
     _dedupe_transactions_grouped,
     _metric,
     _quarantined_duplicates,
+    _select_transactions_silver,
     _set_light_raw_profile,
 )
 
@@ -477,6 +497,14 @@ def _transform_dimensions(config):
     bronze_root = output_path(config, "bronze")
     silver_root = output_path(config, "silver")
     gold_root = output_path(config, "gold")
+    credibility_rules = load_credibility_rules(config)
+    account_types = domain_values("accounts.account_type", credibility_rules, ACCOUNT_TYPES)
+    account_statuses = domain_values("accounts.account_status", credibility_rules, ACCOUNT_STATUSES)
+    product_tiers = domain_values("accounts.product_tier", credibility_rules, PRODUCT_TIERS)
+    digital_channels = domain_values("accounts.digital_channel", credibility_rules, DIGITAL_CHANNELS)
+    genders = domain_values("customers.gender", credibility_rules, GENDERS)
+    customer_provinces = domain_values("customers.province", credibility_rules, SA_PROVINCES)
+    kyc_statuses = domain_values("customers.kyc_status", credibility_rules, KYC_STATUSES)
 
     customers_b = read_delta(spark, f"{bronze_root}/customers")
     accounts_b = read_delta(spark, f"{bronze_root}/accounts")
@@ -492,15 +520,15 @@ def _transform_dimensions(config):
         null_customer_count=_count_if(is_blank(F.col("customer_id"))),
         date_customer_count=_count_if(F.col("dob_date_variant")),
         dob_parse_failed_count=_count_if(~is_blank(F.col("dob")) & F.col("dob_parsed").isNull()),
-        invalid_gender_count=_count_if(invalid_domain(F.col("gender"), GENDERS)),
-        invalid_customer_province_count=_count_if(invalid_domain(F.col("province"), SA_PROVINCES)),
-        invalid_kyc_status_count=_count_if(invalid_domain(F.col("kyc_status"), KYC_STATUSES)),
+        invalid_gender_count=_count_if(invalid_domain(F.col("gender"), genders)),
+        invalid_customer_province_count=_count_if(invalid_domain(F.col("province"), customer_provinces)),
+        invalid_kyc_status_count=_count_if(invalid_domain(F.col("kyc_status"), kyc_statuses)),
         gender_distinct_count=approx_distinct_values(F.col("gender")),
-        gender_unknown_distinct_count=approx_distinct_unknown_values(F.col("gender"), GENDERS),
+        gender_unknown_distinct_count=approx_distinct_unknown_values(F.col("gender"), genders),
         customer_province_distinct_count=approx_distinct_values(F.col("province")),
-        customer_province_unknown_distinct_count=approx_distinct_unknown_values(F.col("province"), SA_PROVINCES),
+        customer_province_unknown_distinct_count=approx_distinct_unknown_values(F.col("province"), customer_provinces),
         kyc_status_distinct_count=approx_distinct_values(F.col("kyc_status")),
-        kyc_status_unknown_distinct_count=approx_distinct_unknown_values(F.col("kyc_status"), KYC_STATUSES),
+        kyc_status_unknown_distinct_count=approx_distinct_unknown_values(F.col("kyc_status"), kyc_statuses),
         risk_score_outside_range_count=_count_if(
             F.col("risk_score").isNotNull() & ((F.col("risk_score") < 1) | (F.col("risk_score") > 10))
         ),
@@ -547,18 +575,18 @@ def _transform_dimensions(config):
             & F.col("open_date_parsed").isNotNull()
             & (F.col("last_activity_date_parsed") < F.col("open_date_parsed"))
         ),
-        invalid_account_type_count=_count_if(invalid_domain(F.col("account_type"), ACCOUNT_TYPES)),
-        invalid_account_status_count=_count_if(invalid_domain(F.col("account_status"), ACCOUNT_STATUSES)),
-        invalid_product_tier_count=_count_if(invalid_domain(F.col("product_tier"), PRODUCT_TIERS)),
-        invalid_digital_channel_count=_count_if(invalid_domain(F.col("digital_channel"), DIGITAL_CHANNELS)),
+        invalid_account_type_count=_count_if(invalid_domain(F.col("account_type"), account_types)),
+        invalid_account_status_count=_count_if(invalid_domain(F.col("account_status"), account_statuses)),
+        invalid_product_tier_count=_count_if(invalid_domain(F.col("product_tier"), product_tiers)),
+        invalid_digital_channel_count=_count_if(invalid_domain(F.col("digital_channel"), digital_channels)),
         account_type_distinct_count=approx_distinct_values(F.col("account_type")),
-        account_type_unknown_distinct_count=approx_distinct_unknown_values(F.col("account_type"), ACCOUNT_TYPES),
+        account_type_unknown_distinct_count=approx_distinct_unknown_values(F.col("account_type"), account_types),
         account_status_distinct_count=approx_distinct_values(F.col("account_status")),
-        account_status_unknown_distinct_count=approx_distinct_unknown_values(F.col("account_status"), ACCOUNT_STATUSES),
+        account_status_unknown_distinct_count=approx_distinct_unknown_values(F.col("account_status"), account_statuses),
         product_tier_distinct_count=approx_distinct_values(F.col("product_tier")),
-        product_tier_unknown_distinct_count=approx_distinct_unknown_values(F.col("product_tier"), PRODUCT_TIERS),
+        product_tier_unknown_distinct_count=approx_distinct_unknown_values(F.col("product_tier"), product_tiers),
         digital_channel_distinct_count=approx_distinct_values(F.col("digital_channel")),
-        digital_channel_unknown_distinct_count=approx_distinct_unknown_values(F.col("digital_channel"), DIGITAL_CHANNELS),
+        digital_channel_unknown_distinct_count=approx_distinct_unknown_values(F.col("digital_channel"), digital_channels),
         negative_current_balance_count=_count_if(F.col("current_balance") < 0),
         negative_credit_limit_count=_count_if(F.col("credit_limit") < 0),
         current_balance_quantiles=F.expr("percentile_approx(current_balance_double, array(0.5, 0.95, 0.99), 100)"),
@@ -632,6 +660,7 @@ def _transform_dimensions(config):
         "account_metrics": account_metrics,
         "account_write_metrics": account_write_metrics,
         "customer_write_metrics": customer_write_metrics,
+        "profile_settings": domain_drift_settings(credibility_rules),
     }
 
 
@@ -656,11 +685,40 @@ def _transform_transaction_bucket(config, bucket_id, dimensions):
     bronze_root = output_path(config, "bronze")
     silver_root = output_path(config, "silver")
     gold_root = output_path(config, "gold")
+    credibility_rules = load_credibility_rules(config)
+    profile_settings = domain_drift_settings(credibility_rules)
+    transaction_types = domain_values("transactions.transaction_type", credibility_rules, TRANSACTION_TYPES)
+    transaction_channels = domain_values("transactions.channel", credibility_rules, TRANSACTION_CHANNELS)
+    transaction_provinces = domain_values("transactions.province", credibility_rules, SA_PROVINCES)
+    transaction_currencies = domain_values("transactions.currency", credibility_rules, {"ZAR"})
 
     transactions_b = read_delta(spark, f"{bronze_root}/transactions").where(F.col("_processing_bucket") == int(bucket_id))
     transactions = _prepare_transactions(transactions_b)
+    transactions_profile = (
+        transactions.withColumn("currency_raw", F.col("currency"))
+        .withColumn("currency_iso_candidate", currency_iso_candidate(F.col("currency")))
+        .withColumn("currency_numeric_candidate", currency_numeric_candidate(F.col("currency")))
+        .withColumn("currency_conversion_required", currency_conversion_required(F.col("currency")))
+        .withColumn("currency_conversion_ready", currency_conversion_ready(F.col("currency")))
+        .withColumn("currency_unknown", currency_unknown(F.col("currency")))
+        .withColumn("geo_coordinate_raw", F.col("location.coordinates"))
+        .withColumn("geo_latitude", coordinate_latitude(F.col("location.coordinates")))
+        .withColumn("geo_longitude", coordinate_longitude(F.col("location.coordinates")))
+        .withColumn("geo_parse_failed", geo_parse_failed(F.col("geo_coordinate_raw"), F.col("geo_latitude"), F.col("geo_longitude")))
+        .withColumn("geo_invalid_world_bounds", geo_invalid_world_bounds(F.col("geo_latitude"), F.col("geo_longitude")))
+        .withColumn("geo_zero_zero", geo_zero_zero(F.col("geo_latitude"), F.col("geo_longitude")))
+        .withColumn("geo_possible_swap", geo_possible_swap(F.col("geo_latitude"), F.col("geo_longitude")))
+        .withColumn("geo_sa_sign_mismatch", geo_sa_sign_mismatch(F.col("geo_latitude"), F.col("geo_longitude")))
+        .withColumn("geo_outside_sa_bounds", geo_outside_sa_bounds(F.col("geo_latitude"), F.col("geo_longitude")))
+        .withColumn(
+            "geo_province_mismatch",
+            geo_province_mismatch(F.col("province"), F.col("geo_latitude"), F.col("geo_longitude"))
+            if profile_settings.get("geo_province_coordinate_check_enabled", False)
+            else F.lit(False),
+        )
+    )
     transaction_metrics = _aggregate_metrics(
-        transactions,
+        transactions_profile,
         source_count=_count_if(F.lit(True)),
         type_count=_count_if(F.col("amount_type_mismatch") | F.col("amount_cast_failed")),
         amount_cast_failed_count=_count_if(F.col("amount_cast_failed")),
@@ -676,9 +734,34 @@ def _transform_transaction_bucket(config, bucket_id, dimensions):
         transaction_date_parse_failed_count=_count_if(~is_blank(F.col("transaction_date")) & F.col("transaction_date_parsed").isNull()),
         currency_count=_count_if(F.col("currency_variant")),
         invalid_currency_count=_count_if(F.col("currency_clean").isNotNull() & (F.col("currency_clean") != "ZAR")),
-        invalid_transaction_type_count=_count_if(invalid_domain(F.col("transaction_type"), TRANSACTION_TYPES)),
-        invalid_channel_count=_count_if(invalid_domain(F.col("channel"), TRANSACTION_CHANNELS)),
-        invalid_transaction_province_count=_count_if(invalid_domain(F.col("province"), SA_PROVINCES)),
+        currency_present_count=_count_if(~is_blank(F.col("currency_raw"))),
+        currency_zar_like_count=_count_if(~is_blank(F.col("currency_raw")) & (F.col("currency_clean") == "ZAR")),
+        currency_non_zar_like_count=_count_if(F.col("currency_conversion_required")),
+        currency_unknown_count=_count_if(F.col("currency_unknown")),
+        currency_iso_candidate_count=_count_if(F.col("currency_iso_candidate").isNotNull()),
+        currency_numeric_candidate_count=_count_if(F.col("currency_numeric_candidate").isNotNull()),
+        currency_conversion_required_count=_count_if(F.col("currency_conversion_required")),
+        currency_conversion_ready_count=_count_if(F.col("currency_conversion_ready")),
+        invalid_transaction_type_count=_count_if(invalid_domain(F.col("transaction_type"), transaction_types)),
+        invalid_channel_count=_count_if(invalid_domain(F.col("channel"), transaction_channels)),
+        invalid_transaction_province_count=_count_if(invalid_domain(F.col("province"), transaction_provinces)),
+        transaction_type_distinct_count=approx_distinct_values(F.col("transaction_type")),
+        transaction_type_unknown_distinct_count=approx_distinct_unknown_values(F.col("transaction_type"), transaction_types),
+        channel_distinct_count=approx_distinct_values(F.col("channel")),
+        channel_unknown_distinct_count=approx_distinct_unknown_values(F.col("channel"), transaction_channels),
+        currency_distinct_count=approx_distinct_values(F.col("currency_clean")),
+        currency_unknown_distinct_count=approx_distinct_unknown_values(F.col("currency_clean"), transaction_currencies),
+        transaction_province_distinct_count=approx_distinct_values(F.col("province")),
+        transaction_province_unknown_distinct_count=approx_distinct_unknown_values(F.col("province"), transaction_provinces),
+        geo_coordinate_present_count=_count_if(~is_blank(F.col("geo_coordinate_raw"))),
+        geo_coordinate_missing_count=_count_if(is_blank(F.col("geo_coordinate_raw"))),
+        geo_coordinate_parse_failed_count=_count_if(F.col("geo_parse_failed")),
+        geo_invalid_world_bounds_count=_count_if(F.col("geo_invalid_world_bounds")),
+        geo_zero_zero_count=_count_if(F.col("geo_zero_zero")),
+        geo_possible_swap_count=_count_if(F.col("geo_possible_swap")),
+        geo_sa_sign_mismatch_count=_count_if(F.col("geo_sa_sign_mismatch")),
+        geo_outside_sa_bounds_count=_count_if(F.col("geo_outside_sa_bounds")),
+        geo_province_mismatch_count=_count_if(F.col("geo_province_mismatch")),
     )
     transaction_id_counts = transactions.groupBy("transaction_id").agg(F.count(F.lit(1)).cast("long").alias("_group_count"))
     duplicate_count = _aggregate_metrics(
@@ -721,21 +804,10 @@ def _transform_transaction_bucket(config, bucket_id, dimensions):
             .when(F.col("currency_variant"), F.lit("CURRENCY_VARIANT"))
             .otherwise(F.lit(None).cast("string")),
         )
-        .select(
-            "transaction_id",
-            "account_id",
-            F.col("transaction_date_parsed").alias("transaction_date"),
-            "transaction_timestamp",
-            "transaction_type",
-            "merchant_category",
-            "merchant_subcategory",
-            F.col("amount_decimal").alias("amount"),
-            F.col("currency_clean").alias("currency"),
-            "channel",
-            "province",
-            "dq_flag",
-            "ingestion_timestamp",
-        )
+    )
+    transactions_silver = _select_transactions_silver(
+        transactions_silver,
+        include_provenance=dimensions.get("profile_settings", {}).get("enable_silver_provenance", False),
     )
     fact_base = transactions_silver.join(
         F.broadcast(dimensions["account_customer"].select("account_id", "account_sk", "customer_sk", "customer_province")),
@@ -801,9 +873,34 @@ def _transform_transaction_bucket(config, bucket_id, dimensions):
         "extreme_amount_count": transaction_metrics["extreme_amount_count"],
         "transaction_date_parse_failed_count": transaction_metrics["transaction_date_parse_failed_count"],
         "invalid_currency_count": transaction_metrics["invalid_currency_count"],
+        "currency_present_count": transaction_metrics["currency_present_count"],
+        "currency_zar_like_count": transaction_metrics["currency_zar_like_count"],
+        "currency_non_zar_like_count": transaction_metrics["currency_non_zar_like_count"],
+        "currency_unknown_count": transaction_metrics["currency_unknown_count"],
+        "currency_iso_candidate_count": transaction_metrics["currency_iso_candidate_count"],
+        "currency_numeric_candidate_count": transaction_metrics["currency_numeric_candidate_count"],
+        "currency_conversion_required_count": transaction_metrics["currency_conversion_required_count"],
+        "currency_conversion_ready_count": transaction_metrics["currency_conversion_ready_count"],
         "invalid_transaction_type_count": transaction_metrics["invalid_transaction_type_count"],
         "invalid_channel_count": transaction_metrics["invalid_channel_count"],
         "invalid_transaction_province_count": transaction_metrics["invalid_transaction_province_count"],
+        "transaction_type_distinct_count": transaction_metrics["transaction_type_distinct_count"],
+        "transaction_type_unknown_distinct_count": transaction_metrics["transaction_type_unknown_distinct_count"],
+        "channel_distinct_count": transaction_metrics["channel_distinct_count"],
+        "channel_unknown_distinct_count": transaction_metrics["channel_unknown_distinct_count"],
+        "currency_distinct_count": transaction_metrics["currency_distinct_count"],
+        "currency_unknown_distinct_count": transaction_metrics["currency_unknown_distinct_count"],
+        "transaction_province_distinct_count": transaction_metrics["transaction_province_distinct_count"],
+        "transaction_province_unknown_distinct_count": transaction_metrics["transaction_province_unknown_distinct_count"],
+        "geo_coordinate_present_count": transaction_metrics["geo_coordinate_present_count"],
+        "geo_coordinate_missing_count": transaction_metrics["geo_coordinate_missing_count"],
+        "geo_coordinate_parse_failed_count": transaction_metrics["geo_coordinate_parse_failed_count"],
+        "geo_invalid_world_bounds_count": transaction_metrics["geo_invalid_world_bounds_count"],
+        "geo_zero_zero_count": transaction_metrics["geo_zero_zero_count"],
+        "geo_possible_swap_count": transaction_metrics["geo_possible_swap_count"],
+        "geo_sa_sign_mismatch_count": transaction_metrics["geo_sa_sign_mismatch_count"],
+        "geo_outside_sa_bounds_count": transaction_metrics["geo_outside_sa_bounds_count"],
+        "geo_province_mismatch_count": transaction_metrics["geo_province_mismatch_count"],
         "silver_output_rows": metric_int(silver_metrics, "numOutputRows"),
         "gold_output_rows": metric_int(gold_metrics, "numOutputRows"),
     }
@@ -848,6 +945,7 @@ def _set_adaptive_light_profile(dimensions, transaction_totals):
         dimensions["account_metrics"],
         dimensions["customer_metrics"],
         metric_int(dimensions["account_write_metrics"], "numOutputRows"),
+        dimensions.get("profile_settings"),
     )
     set_raw_profile_section(
         "adaptive_chunking",

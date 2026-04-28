@@ -7,6 +7,7 @@ profile:
   enable_referential_checks: true
   enable_province_match_check: true
   enable_repeat_pattern_checks: false
+  enable_silver_provenance: false
   repeat_pattern_threshold: 50
   percentile_accuracy: 100
   extreme_amount_threshold: 50000
@@ -16,6 +17,82 @@ profile:
     high_cardinality_unknown_threshold: 50
     high_cardinality_unknown_ratio: 0.25
     top_k_unknown_values: 5
+
+domains:
+  transactions.transaction_type:
+    known_values: [CREDIT, DEBIT, FEE, REVERSAL]
+    normalization: upper_trim
+    unknown_policy: audit_only
+    high_cardinality_threshold: 50
+  transactions.channel:
+    known_values: [POS, APP, ATM, EFT, USSD, INTERNAL]
+    normalization: upper_trim
+    unknown_policy: audit_only
+    high_cardinality_threshold: 50
+  transactions.currency:
+    known_values: [ZAR]
+    normalization: iso4217_upper_trim
+    unknown_policy: audit_only
+    high_cardinality_threshold: 10
+  transactions.province:
+    known_values: [EASTERN CAPE, FREE STATE, GAUTENG, KWAZULU-NATAL, LIMPOPO, MPUMALANGA, NORTH WEST, NORTHERN CAPE, WESTERN CAPE]
+    normalization: upper_trim
+    unknown_policy: audit_only
+    high_cardinality_threshold: 20
+  accounts.account_type:
+    known_values: [SAVINGS, TRANSACTIONAL, CREDIT]
+    normalization: upper_trim
+    unknown_policy: audit_only
+    high_cardinality_threshold: 20
+  accounts.account_status:
+    known_values: [ACTIVE, DORMANT, CLOSED, SUSPENDED]
+    normalization: upper_trim
+    unknown_policy: audit_only
+    high_cardinality_threshold: 20
+  accounts.product_tier:
+    known_values: [BASIC, STANDARD, PREMIUM]
+    normalization: upper_trim
+    unknown_policy: audit_only
+    high_cardinality_threshold: 20
+  accounts.digital_channel:
+    known_values: [APP, USSD, WEB]
+    normalization: upper_trim
+    unknown_policy: audit_only
+    high_cardinality_threshold: 20
+  customers.gender:
+    known_values: [M, F, NB, UNKNOWN]
+    normalization: upper_trim
+    unknown_policy: audit_only
+    high_cardinality_threshold: 20
+  customers.province:
+    known_values: [EASTERN CAPE, FREE STATE, GAUTENG, KWAZULU-NATAL, LIMPOPO, MPUMALANGA, NORTH WEST, NORTHERN CAPE, WESTERN CAPE]
+    normalization: upper_trim
+    unknown_policy: audit_only
+    high_cardinality_threshold: 20
+  customers.kyc_status:
+    known_values: [VERIFIED, PENDING, FAILED]
+    normalization: upper_trim
+    unknown_policy: audit_only
+    high_cardinality_threshold: 20
+
+currency:
+  conversion_policy: preserve_only
+  canonical_gold_currency: ZAR
+  accepted_zar_aliases: [ZAR, R, RANDS, "710"]
+  downstream_fx_required_for_non_zar: true
+
+geo:
+  coordinate_system: EPSG:4326
+  parse_field: transactions.location.coordinates
+  unknown_policy: audit_only
+  enable_province_coordinate_check: false
+  privacy:
+    emit_exact_coordinate_examples: false
+  south_africa_bounds:
+    latitude_min: -35.0
+    latitude_max: -22.0
+    longitude_min: 16.0
+    longitude_max: 33.5
 
 advisory_rules:
   INVALID_DOMAIN:
@@ -46,3 +123,7 @@ advisory_rules:
     severity: medium
     mode: audit_only
     description: Known domain columns contain new values or high-cardinality unknown value explosions.
+  GEO_COORDINATE_ANOMALY:
+    severity: medium
+    mode: audit_only
+    description: Coordinates are missing, malformed, out of bounds, swapped, or inconsistent with coarse geography.

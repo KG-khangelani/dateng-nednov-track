@@ -32,6 +32,8 @@ from pipeline.credibility import (
     TRANSACTION_TYPES,
     advisory_rule_catalog,
     count_if,
+    domain_drift_settings,
+    domain_values,
     invalid_domain,
     is_blank,
     normalized,
@@ -39,6 +41,26 @@ from pipeline.credibility import (
 )
 from pipeline.domain_drift import full_domain_drift
 from pipeline.metrics import METRICS
+from pipeline.readiness import (
+    coordinate_latitude,
+    coordinate_longitude,
+    currency_conversion_ready,
+    currency_conversion_required,
+    currency_iso_candidate,
+    currency_normalized,
+    currency_numeric_candidate,
+    currency_readiness_summary,
+    currency_unknown,
+    geo_anomaly_flags,
+    geo_invalid_world_bounds,
+    geo_outside_sa_bounds,
+    geo_parse_failed,
+    geo_possible_swap,
+    geo_province_mismatch,
+    geo_quality_summary,
+    geo_sa_sign_mismatch,
+    geo_zero_zero,
+)
 
 
 DEFAULT_CREDIBILITY_RULES = "/data/config/credibility_rules.yaml"
@@ -73,7 +95,7 @@ def _settings(rules):
     mode = str(os.environ.get("CREDIBILITY_PROFILE_MODE", profile.get("mode", "light"))).strip().lower()
     if mode not in {"light", "full", "off"}:
         mode = "light"
-    return {
+    settings = {
         "enabled": bool(profile.get("enabled", True)),
         "mode": mode,
         "output_path": profile.get("output_path", DEFAULT_PROFILE_OUTPUT),
@@ -91,6 +113,8 @@ def _settings(rules):
         "domain_drift_unknown_ratio": float(domain_drift.get("high_cardinality_unknown_ratio", 0.25)),
         "domain_drift_top_k": int(domain_drift.get("top_k_unknown_values", profile.get("top_k", 5))),
     }
+    settings.update(domain_drift_settings(rules))
+    return settings
 
 
 def raw_profile_mode(config=None):
@@ -178,13 +202,38 @@ def _transaction_profile(transactions, settings):
     transaction_date = F.col("_transaction_date_parsed")
     timestamp = F.col("_transaction_timestamp_parsed")
     province = F.col("location.province")
-    currency_normalized = normalized(F.col("currency"))
+    currency_normalized_col = normalized(F.col("currency"))
     currency_clean = normalise_currency(F.col("currency"))
+    transaction_types = domain_values("transactions.transaction_type", settings, TRANSACTION_TYPES)
+    transaction_channels = domain_values("transactions.channel", settings, TRANSACTION_CHANNELS)
+    transaction_provinces = domain_values("transactions.province", settings, SA_PROVINCES)
 
     prepared = (
         transactions.withColumn("_amount_double", F.col("amount").cast("double"))
         .withColumn("_transaction_date_parsed", parse_date(F.col("transaction_date")))
         .withColumn("_transaction_timestamp_parsed", parse_timestamp(F.col("transaction_date"), F.col("transaction_time")))
+        .withColumn("_currency_normalized", currency_normalized(F.col("currency")))
+        .withColumn("_currency_iso_candidate", currency_iso_candidate(F.col("currency")))
+        .withColumn("_currency_numeric_candidate", currency_numeric_candidate(F.col("currency")))
+        .withColumn("_currency_conversion_required", currency_conversion_required(F.col("currency")))
+        .withColumn("_currency_conversion_ready", currency_conversion_ready(F.col("currency")))
+        .withColumn("_currency_unknown", currency_unknown(F.col("currency")))
+        .withColumn("_geo_coordinate_raw", F.col("location.coordinates"))
+        .withColumn("_geo_latitude", coordinate_latitude(F.col("location.coordinates")))
+        .withColumn("_geo_longitude", coordinate_longitude(F.col("location.coordinates")))
+        .withColumn("_geo_parse_failed", geo_parse_failed(F.col("_geo_coordinate_raw"), F.col("_geo_latitude"), F.col("_geo_longitude")))
+        .withColumn("_geo_invalid_world_bounds", geo_invalid_world_bounds(F.col("_geo_latitude"), F.col("_geo_longitude")))
+        .withColumn("_geo_zero_zero", geo_zero_zero(F.col("_geo_latitude"), F.col("_geo_longitude")))
+        .withColumn("_geo_possible_swap", geo_possible_swap(F.col("_geo_latitude"), F.col("_geo_longitude")))
+        .withColumn("_geo_sa_sign_mismatch", geo_sa_sign_mismatch(F.col("_geo_latitude"), F.col("_geo_longitude")))
+        .withColumn("_geo_outside_sa_bounds", geo_outside_sa_bounds(F.col("_geo_latitude"), F.col("_geo_longitude")))
+        .withColumn(
+            "_geo_province_mismatch",
+            geo_province_mismatch(province, F.col("_geo_latitude"), F.col("_geo_longitude"))
+            if settings.get("geo_province_coordinate_check_enabled", False)
+            else F.lit(False),
+        )
+        .withColumn("_geo_anomaly_flags", geo_anomaly_flags(F.col("_geo_coordinate_raw"), province, F.col("_geo_latitude"), F.col("_geo_longitude")))
     )
 
     row = _first_aggregate(
@@ -203,17 +252,34 @@ def _transaction_profile(transactions, settings):
         amount_quantiles=F.expr(
             f"percentile_approx(_amount_double, array(0.5, 0.95, 0.99), {settings['percentile_accuracy']})"
         ),
-        invalid_transaction_type=count_if(invalid_domain(F.col("transaction_type"), TRANSACTION_TYPES)),
-        invalid_channel=count_if(invalid_domain(F.col("channel"), TRANSACTION_CHANNELS)),
+        invalid_transaction_type=count_if(invalid_domain(F.col("transaction_type"), transaction_types)),
+        invalid_channel=count_if(invalid_domain(F.col("channel"), transaction_channels)),
         date_parse_failed=count_if(~is_blank(F.col("transaction_date")) & transaction_date.isNull()),
         timestamp_parse_failed=count_if(~is_blank(F.col("transaction_time")) & timestamp.isNull()),
         future_transaction_date=count_if(transaction_date > F.current_date()),
-        currency_variant=count_if(~is_blank(F.col("currency")) & (currency_normalized != "ZAR") & (currency_clean == "ZAR")),
+        currency_variant=count_if(~is_blank(F.col("currency")) & (currency_normalized_col != "ZAR") & (currency_clean == "ZAR")),
         invalid_currency=count_if(~is_blank(F.col("currency")) & currency_clean.isNotNull() & (currency_clean != "ZAR")),
+        currency_present_count=count_if(~is_blank(F.col("currency"))),
+        currency_zar_like_count=count_if(~is_blank(F.col("currency")) & (currency_clean == "ZAR")),
+        currency_non_zar_like_count=count_if(F.col("_currency_conversion_required")),
+        currency_unknown_count=count_if(F.col("_currency_unknown")),
+        currency_iso_candidate_count=count_if(F.col("_currency_iso_candidate").isNotNull()),
+        currency_numeric_candidate_count=count_if(F.col("_currency_numeric_candidate").isNotNull()),
+        currency_conversion_required_count=count_if(F.col("_currency_conversion_required")),
+        currency_conversion_ready_count=count_if(F.col("_currency_conversion_ready")),
         null_province=count_if(is_blank(province)),
-        invalid_province=count_if(invalid_domain(province, SA_PROVINCES)),
+        invalid_province=count_if(invalid_domain(province, transaction_provinces)),
         merchant_subcategory_missing=count_if(is_blank(F.col("merchant_subcategory"))),
         retry_flagged=count_if(F.col("metadata.retry_flag") == F.lit(True)),
+        geo_coordinate_present_count=count_if(~is_blank(F.col("_geo_coordinate_raw"))),
+        geo_coordinate_missing_count=count_if(is_blank(F.col("_geo_coordinate_raw"))),
+        geo_coordinate_parse_failed_count=count_if(F.col("_geo_parse_failed")),
+        geo_invalid_world_bounds_count=count_if(F.col("_geo_invalid_world_bounds")),
+        geo_zero_zero_count=count_if(F.col("_geo_zero_zero")),
+        geo_possible_swap_count=count_if(F.col("_geo_possible_swap")),
+        geo_sa_sign_mismatch_count=count_if(F.col("_geo_sa_sign_mismatch")),
+        geo_outside_sa_bounds_count=count_if(F.col("_geo_outside_sa_bounds")),
+        geo_province_mismatch_count=count_if(F.col("_geo_province_mismatch")),
     )
 
     total = row["rows"]
@@ -255,6 +321,8 @@ def _transaction_profile(transactions, settings):
         "operational_signals": {
             "retry_flagged": _metric(row["retry_flagged"], total),
         },
+        "currency_readiness": currency_readiness_summary(row, total),
+        "geo_quality": geo_quality_summary(row, total),
     }
     _with_top_k(
         profile,
@@ -276,6 +344,10 @@ def _account_profile(accounts, settings):
     credit_limit = F.col("_credit_limit_double")
     current_balance = F.col("_current_balance_double")
     account_type = normalized(F.col("account_type"))
+    account_types = domain_values("accounts.account_type", settings, ACCOUNT_TYPES)
+    account_statuses = domain_values("accounts.account_status", settings, ACCOUNT_STATUSES)
+    product_tiers = domain_values("accounts.product_tier", settings, PRODUCT_TIERS)
+    digital_channels = domain_values("accounts.digital_channel", settings, DIGITAL_CHANNELS)
 
     prepared = (
         accounts.withColumn("_open_date_parsed", parse_date(F.col("open_date")))
@@ -290,10 +362,10 @@ def _account_profile(accounts, settings):
         distinct_account_ids=_distinct(F.col("account_id")),
         null_account_id=count_if(is_blank(F.col("account_id"))),
         null_customer_ref=count_if(is_blank(F.col("customer_ref"))),
-        invalid_account_type=count_if(invalid_domain(F.col("account_type"), ACCOUNT_TYPES)),
-        invalid_account_status=count_if(invalid_domain(F.col("account_status"), ACCOUNT_STATUSES)),
-        invalid_product_tier=count_if(invalid_domain(F.col("product_tier"), PRODUCT_TIERS)),
-        invalid_digital_channel=count_if(invalid_domain(F.col("digital_channel"), DIGITAL_CHANNELS)),
+        invalid_account_type=count_if(invalid_domain(F.col("account_type"), account_types)),
+        invalid_account_status=count_if(invalid_domain(F.col("account_status"), account_statuses)),
+        invalid_product_tier=count_if(invalid_domain(F.col("product_tier"), product_tiers)),
+        invalid_digital_channel=count_if(invalid_domain(F.col("digital_channel"), digital_channels)),
         open_date_parse_failed=count_if(~is_blank(F.col("open_date")) & open_date.isNull()),
         last_activity_date_parse_failed=count_if(~is_blank(F.col("last_activity_date")) & last_activity.isNull()),
         future_open_date=count_if(open_date > F.current_date()),
@@ -363,6 +435,9 @@ def _customer_profile(customers, settings):
     dob = F.col("_dob_parsed")
     risk_score = F.col("_risk_score_int")
     age_years = F.floor(F.months_between(F.current_date(), dob) / F.lit(12))
+    genders = domain_values("customers.gender", settings, GENDERS)
+    customer_provinces = domain_values("customers.province", settings, SA_PROVINCES)
+    kyc_statuses = domain_values("customers.kyc_status", settings, KYC_STATUSES)
 
     prepared = (
         customers.withColumn("_dob_parsed", parse_date(F.col("dob")))
@@ -374,9 +449,9 @@ def _customer_profile(customers, settings):
         rows=F.count(F.lit(1)),
         distinct_customer_ids=_distinct(F.col("customer_id")),
         null_customer_id=count_if(is_blank(F.col("customer_id"))),
-        invalid_gender=count_if(invalid_domain(F.col("gender"), GENDERS)),
-        invalid_province=count_if(invalid_domain(F.col("province"), SA_PROVINCES)),
-        invalid_kyc_status=count_if(invalid_domain(F.col("kyc_status"), KYC_STATUSES)),
+        invalid_gender=count_if(invalid_domain(F.col("gender"), genders)),
+        invalid_province=count_if(invalid_domain(F.col("province"), customer_provinces)),
+        invalid_kyc_status=count_if(invalid_domain(F.col("kyc_status"), kyc_statuses)),
         dob_parse_failed=count_if(~is_blank(F.col("dob")) & dob.isNull()),
         future_dob=count_if(dob > F.current_date()),
         under_18=count_if(dob.isNotNull() & (age_years < 18)),
@@ -555,6 +630,8 @@ def _light_profile(rules, settings, duration_seconds):
         "tables": raw_profile.get("tables", {}),
         "cross_table": raw_profile.get("cross_table", {}),
         "domain_drift": raw_profile.get("domain_drift", {}),
+        "currency_readiness": raw_profile.get("currency_readiness", {}),
+        "geo_quality": raw_profile.get("geo_quality", {}),
         "adaptive_chunking": raw_profile.get("adaptive_chunking", {}),
         "performance_observation": {
             "profiling_duration_seconds": duration_seconds,
@@ -618,6 +695,8 @@ def run_raw_profile():
         "tables": table_profiles,
         "cross_table": cross_table,
         "domain_drift": domain_drift,
+        "currency_readiness": table_profiles["transactions"].get("currency_readiness", {}),
+        "geo_quality": table_profiles["transactions"].get("geo_quality", {}),
         "performance_observation": {
             "profiling_duration_seconds": int(time.time() - started_at),
             "section_duration_seconds": section_durations,
